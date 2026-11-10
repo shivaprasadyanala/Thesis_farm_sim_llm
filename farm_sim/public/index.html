@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Farm Sim — server-authoritative</title>
+  <link rel="stylesheet" href="./styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.1/dist/phaser.min.js"></script>
+</head>
+<body>
+  <div id="game-container"></div>
+
+  <div id="hud">
+    <section class="panel panel-clock">
+      <div class="clock-row">
+        <span id="hud-clock" class="clock">06:00</span>
+        <span id="hud-money-wrap" class="money-chip"><b id="hud-money-chip">$0.00</b><i id="hud-money-delta"></i></span>
+      </div>
+      <div id="hud-day" class="muted day-line">Day 1 · spring</div>
+      <div class="weather-row">
+        <span id="hud-weather">Sunny</span>
+        <span id="hud-temp" class="muted">20°C</span>
+        <span id="hud-forecast" class="muted"></span>
+      </div>
+      <div id="hud-task" class="task">Loading…</div>
+      <div id="hud-objective" class="objective"></div>
+    </section>
+
+    <section class="panel panel-stats">
+      <div class="stat"><span>Money</span><b id="hud-money">$0</b></div>
+      <div class="stat"><span>Energy</span><b id="hud-energy">100</b></div>
+      <div class="bar"><i id="hud-energy-bar"></i></div>
+      <div class="stat"><span>Can</span><b id="hud-can">0 / 10 L</b></div>
+      <div class="bar"><i id="hud-can-bar"></i></div>
+      <div class="stat"><span>Tank</span><b id="hud-tank">0 / 0 L</b></div>
+      <div class="bar"><i id="hud-tank-bar"></i></div>
+      <div class="stat"><span>Seeds</span><b id="hud-seeds">—</b></div>
+      <div class="stat"><span>Silo</span><b id="hud-silo">0 kg</b></div>
+      <div class="bar"><i id="hud-silo-bar"></i></div>
+      <div class="stat"><span>Rovers</span><b id="hud-robots">—</b></div>
+    </section>
+
+    <section class="panel panel-inspect">
+      <div class="panel-title">Inspector</div>
+      <div id="hud-inspect" class="inspect">Stand on or next to a plot.</div>
+    </section>
+
+    <section class="panel panel-log">
+      <div class="panel-title">Events</div>
+      <ul id="hud-events"></ul>
+    </section>
+
+    <section class="panel panel-help">
+      <div><kbd>WASD</kbd>/<kbd>↑↓←→</kbd> move</div>
+      <div><kbd>Space</kbd> context action on the faced plot</div>
+      <div><kbd>1</kbd>–<kbd>4</kbd> pick seed · <kbd>C</kbd> collect water · <kbd>R</kbd> rest</div>
+      <div><kbd>M</kbd> moisture overlay · <kbd>P</kbd> pause · <kbd>+</kbd>/<kbd>-</kbd> speed</div>
+      <div><kbd>F</kbd> dispatch rover · <kbd>G</kbd> sell the silo at the barn (5,4)</div>
+    </section>
+  </div>
+
+  <div id="toast"></div>
+  <div id="connection" class="offline">connecting…</div>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

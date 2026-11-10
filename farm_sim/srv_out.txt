@@ -1,0 +1,42 @@
+[farm-sim] 1.0.0 running at http://127.0.0.1:3111
+[farm-sim] preset=normal seed=1 tick=500ms
+[farm-sim] state:   GET  /api/v1/state
+[farm-sim] action:  POST /api/v1/action  { "type": "water", "tile": [12, 8] }
+[farm-sim] advance: POST /api/v1/advance { "minutes": 720 }
+[farm-sim] advance is capped at 5000 ticks per call
+[farm-sim] access log on (LOG_REQUESTS=0 silences it) - every action an agent posts is printed here
+[farm-sim] POST reset preset=easy seed=1 -> ok (1 ms)
+[farm-sim] POST till [19,11] -> FAILED TOO_FAR Too far: stand within 1 tile(s) of 19,11. (2 ms)
+[farm-sim] POST reset preset=easy seed=1 -> ok (1 ms)
+[farm-sim] POST move_to [12,8] -> ok Arrived at 12,8. (2 ms)
+[farm-sim] POST till [12,8] -> ok Tilled plot p01. (1 ms)
+[farm-sim] POST plant_crop [12,8] -> ok Planted Wheat on plot p01. (2 ms)
+[farm-sim] POST move_to [3,10] -> ok Arrived at 3,10. (2 ms)
+[farm-sim] POST collect_water -> ok Collected 10 L of water. (2 ms)
+[farm-sim] POST move_to [12,8] -> ok Arrived at 12,8. (2 ms)
+[farm-sim] POST water [12,8] -> ok Watered plot p01 with 2 L. (1 ms)
+[farm-sim] POST till [13,8] -> ok Tilled plot p02. (2 ms)
+[farm-sim] POST plant_crop [13,8] -> ok Planted Wheat on plot p02. (1 ms)
+[farm-sim] POST water [13,8] -> ok Watered plot p02 with 2 L. (2 ms)
+[farm-sim] POST till [14,8] -> FAILED TOO_FAR Too far: stand within 1 tile(s) of 14,8. (2 ms)
+[farm-sim] POST move_to [14,8] -> ok Arrived at 14,8. (1 ms)
+[farm-sim] POST till [14,8] -> ok Tilled plot p03. (2 ms)
+[farm-sim] POST plant_crop [14,8] -> ok Planted Wheat on plot p03. (1 ms)
+[farm-sim] POST water [14,8] -> ok Watered plot p03 with 2 L. (1 ms)
+[farm-sim] POST advance -> ok Advanced 120 tick(s). (8 ms)
+[farm-sim] POST move_to [3,10] -> ok Arrived at 3,10. (1 ms)
+[farm-sim] POST collect_water -> ok Collected 6 L of water. (1 ms)
+[farm-sim] POST move_to [12,8] -> ok Arrived at 12,8. (2 ms)
+[farm-sim] POST water [12,8] -> ok Watered plot p01 with 2 L. (0 ms)
+[farm-sim] POST water [13,8] -> ok Watered plot p02 with 2 L. (1 ms)
+[farm-sim] POST water [14,8] -> FAILED TOO_FAR Too far: stand within 1 tile(s) of 14,8. (4 ms)
+[farm-sim] POST move_to [14,8] -> ok Arrived at 14,8. (1 ms)
+[farm-sim] POST water [14,8] -> ok Watered plot p03 with 2 L. (1 ms)
+[farm-sim] POST advance -> ok Advanced 120 tick(s). (8 ms)
+[farm-sim] POST advance -> ok Advanced 120 tick(s). (3 ms)
+[farm-sim] POST advance -> ok Advanced 120 tick(s). (4 ms)
+[farm-sim] POST move_to [3,10] -> ok Arrived at 3,10. (1 ms)
+[farm-sim] POST collect_water -> ok Collected 6 L of water. (2 ms)
+[farm-sim] POST move_to [12,8] -> ok Arrived at 12,8. (1 ms)
+[farm-sim] POST water [12,8] -> ok Watered plot p01 with 2 L. (3 ms)
+[farm-sim] POST move_to [13,8] -> ok Arrived at 13,8. (2 ms)
