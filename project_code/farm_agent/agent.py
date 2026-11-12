@@ -303,6 +303,9 @@ def run_agent_vllm(args, schemas):
     silent_steps = 0  # consecutive model turns without a tool call
     stuck_repeats = 0  # consecutive identical tool calls
     last_signature = None
+    total_time_taken = 0.0
+    episode_start_time = time.time()
+    
     try:
         i = 0
         while i < args.max_steps:
@@ -314,6 +317,7 @@ def run_agent_vllm(args, schemas):
             messages = trim_history(messages)
             response = chat_completion(client, args.model, messages, schemas, i)
             step_time = time.time() - st_time
+            total_time_taken+=step_time
             message = response.choices[0].message
 
             usage = getattr(response, "usage", None)
@@ -472,3 +476,7 @@ def run_agent_vllm(args, schemas):
               f"does /v1/models list '{args.model}', and does that deployment serve tools?")
         print("nothing was posted to the game after the last tool call above")
         logger.error(f"model server: {vllm_base_url()} model={args.model}")
+    finally:
+        queue_finish_time = time.time()
+        true_end_to_end_latency = queue_finish_time - episode_start_time
+        logger.info(f"total time taken by tools: {total_time_taken:.2f} seconds")
