@@ -45,12 +45,13 @@ Every `POST /api/v1/*` is echoed in the server terminal, e.g.
 `[farm-sim] POST water [12,8] -> ok Watered plot p01 with 2 L. (3 ms)`, so an
 agent run can be followed without a browser. The 500 ms ticker never logs.
 
-> **Port used by the Python baseline.** `ai_agents/agentic_approach_baseline_farm_sim.py`
+> **Port used by the Python baseline.** `project_code/agentic_approach_baseline_farm_sim.py`
 > targets `http://127.0.0.1:3111` (`server_urls.farm_sim_url` in
-> `ai_agents/config.yaml`). Start the sim with `PORT=3111 npm start`
+> `project_code/config.yaml`). Start the sim with `PORT=3111 npm start`
 > (PowerShell: `$env:PORT=3111; npm start`) and open <http://127.0.0.1:3111>,
 > otherwise the agent posts to a port this server is not listening on. `--url`
-> overrides it per run.
+> overrides it per run. The client itself - flags, modules, artefacts - is
+> documented in [`../project_code/README.md`](../project_code/README.md).
 
 Other commands:
 
@@ -164,7 +165,7 @@ answers `ok: true` with `steps: 0`.
 and water two crops (`easy`), harvest three before day 10 (`normal`), earn $150 and
 harvest four before day 18 (`hard`). The objective is what the Python baseline
 hands the model as its task
-(`ai_agents/agentic_approach_baseline_farm_sim.py` reads `objective.text` from
+(`project_code/agentic_approach_baseline_farm_sim.py` reads `objective.text` from
 the state; `--task "..."` only rewrites that wording), so the prompt and the
 score agree. The server re-evaluates the objective inside every action as well as
 in the tick, so the action that completes it already answers with
@@ -281,6 +282,132 @@ deadline, state), `metrics`, the last events and the crop catalog.
 | GET/POST | `/get_game_state`, `/post_game_state` | original protocol (below) |
 | POST/GET | `/set_game_task`, `/get_game_task` | task text for the old agents |
 
+## Scoring: the points an agent earns
+
+The simulation is the only judge - there is no reward model and no external
+evaluator. It keeps a handful of counters while the episode runs, turns them into
+one scalar (`sim/metrics.js`) and reports that scalar plus the objective bonus.
+An agent cannot earn points by talking or by looking at the field: only selling,
+harvesting, watering/keeping crops alive and finishing the objective move the
+number.
+
+### Where the points show up
+
+| surface | field |
+| --- | --- |
+| every `POST /api/v1/action` reply | `reward`: the points this single action changed (can be negative) |
+| `GET /api/v1/state` (and the state echoed by `/action`) | `metrics.score`, `metrics.reward`, `objective.progress` / `reward` / `is_complete` / `is_failed` |
+| the episode is won | `objective.reward` is paid into `player.money` |
+| `runner.js` | the `score` column and the closing `score=` line |
+| the Python client | `points_gained` in `_summary.json` (= `metrics.score`) |
+
+### The score
+
+`sim/metrics.js` is the whole definition:
+
+```
+score = earned              # $ from selling, at the market price of the day
+      + 8  * harvests       # every harvested crop, independent of weight
+      + 0.5 * kg_harvested  # weight, so a big harvest beats a small one
+      + 50 * objective_completed   # the goal is worth more than any single action
+      - 0.25 * invalid_actions     # a rejected action
+      - 2  * crops_died            # a crop that withered
+```
+
+rounded to two decimals. Each term is a counter in `world.metrics`
+(`sim/world.js`):
+
+| counter | incremented by | weight | why |
+| --- | --- | --- | --- |
+| `earned` | `economy.sell` (`economy.js`) | 1 | the farmer's actual revenue, so market timing counts |
+| `harvests` | `crop.harvest` (`crop.js`) | 8 | progress on the objective, cheap to reach |
+| `kg_harvested` | `crop.harvest` | 0.5 | rewards yield, not only count |
+| `objective_completed` | `objective.update` (`objective.js`) | 50 | the goal dominates everything else |
+| `invalid_actions` | `applyAction` (`actions.js`) | -0.25 | a rejected call costs something but not the run |
+| `crops_died` | `crop.update` (`crop.js`) | -2 | neglect is punished, still cheaper than a lost harvest |
+
+The other counters (`actions`, `valid_actions`, `kg_sold`, `kg_spoiled`, `spent`,
+`water_used`, `water_collected`, `robot_tiles`, `tiles_walked`, `reward`) are
+reported in the state and in the summaries but carry **no** score weight -
+spending money or watering is not scored by itself, only through the harvest and
+the objective it enables.
+
+### The reward on a single action
+
+`applyAction` (`sim/actions.js`) computes
+
+```
+scoreBefore = computeScore(world)
+... the action ...
+objective.update(world)          # may complete the goal and pay the bonus
+result.reward = computeScore(world) - scoreBefore
+```
+
+and adds it to `world.metrics.reward`. Consequences worth knowing when reading a
+log:
+
+* the action that completes the objective carries the whole **+50** itself, plus
+  whatever it earned otherwise;
+* a rejected action is exactly **-0.25** (only `invalid_actions` moved);
+* `advance` can be **negative**: crops die, spoil or the season turns while the
+  clock runs;
+* a valid but pointless action (`scan`, `inspect`, `record`, a successful
+  `advance` over a healthy field) is **0**, and so is `water` on already-moist
+  soil - the agent pays for those in steps, not in points.
+
+### The three objectives
+
+The goal is data plus a predicate (`sim/systems/objective.js`), and it is scored
+twice: 50 points through `objective_completed`, and its `reward` in money.
+
+| id | text | deadline | reward | `complete()` |
+| --- | --- | --- | --- | --- |
+| `starter_easy` | Plant 2 crops and keep them watered. | day 8 | $40 | `planted >= 2 && watered >= 2` |
+| `harvest_normal` | Harvest 3 crops before the end of day 10. | day 10 | $60 | `harvests >= 3` |
+| `profit_hard` | Earn $150 from sales and harvest 4 crops before day 18. | day 18 | $100 | `earned >= 150 && harvests >= 4` |
+
+"Watered" means irrigated **after** planting and still moist - rain alone never
+counts. Completion pays `reward` into `player.money` (not into `earned`, so the
+money bonus is *not* scored a second time), sets `objective_completed = 1` and
+stamps `completed_day`. Missing the deadline sets `is_failed` and ends the
+episode: no fine is subtracted, but the 50 points and the money bonus are gone
+and the agent stops there.
+
+### A worked example
+
+`node runner.js --preset normal --seed 2 --days 9 --policy care --plots 4` - after
+the first real harvest day the counters read `earned=69.33`, `harvests=3`,
+`kg_harvested=7.65`, `objective_completed=1`, `invalid_actions=0`,
+`crops_died=0`:
+
+```
+69.33 + 8*3 + 0.5*7.65 + 50*1 = 147.16
+```
+
+with `player.money = 60 (start) + 69.33 (sales) + 60 (objective reward) = 189.33`.
+The objective bonus never shows up in `earned`, which is why the score cannot be
+reconstructed from the wallet alone.
+
+### What does not score
+
+* the wallet, the silo and the tank - only their *effects* (a sale, a harvest)
+  are counted;
+* `scan`, `inspect`, `record`, and a successful `advance` over a healthy field:
+  valid, 0 points, but they consume steps;
+* buying: seeds and water cost money (`spent`) but are not penalised, and selling
+  on a bad market day simply earns less;
+* being slow without failing: a run that hits the step limit scores what it
+  accumulated, nothing is subtracted.
+
+### Live versus cached score
+
+`metrics.score` in the state is computed on read (`sim/observation.js`), so it is
+always current. The runner's daily `score` column prints `world.metrics.score`,
+which `sim/loop.js` refreshes once per tick, so after actions that happen between
+two ticks the column can lag the live value by one tick (the closing `score=`
+line is the value at the last tick). Query `GET /api/v1/state` when an exact
+figure matters.
+
 ## Legacy compatibility (`agentic_approach*.py`)
 
 The original agents move in **25 px** steps (`a_star_algo.py` hardcodes
@@ -306,8 +433,9 @@ So `state["crops"]` now contains **32** entries (`crop1`..`crop32`) instead of
 three. Agents that iterate their own local dict are unaffected; anything that
 assumes exactly N crops should switch to `/api/v1/state`.
 
-The existing `ai_agents/config.yaml` points at `http://localhost:3000`, so run
-the new server with `PORT=3000 npm start` to keep the Python side unchanged.
+A `config.yaml` that still points at `http://localhost:3000` (older agent
+variants) needs the new server started with `PORT=3000 npm start`; the current
+`project_code/config.yaml` uses `127.0.0.1:3111` instead.
 `sim/legacy.js` ignores the tuple-keyed crop entries the old agent posts
 (`"(400, 275)"`); only entries with a `pos` array are replayed.
 
@@ -315,16 +443,24 @@ the new server with `PORT=3000 npm start` to keep the Python side unchanged.
 
 ```
 $ node runner.js --preset normal --seed 2 --days 9 --policy care --plots 4
+farm-sim runner · preset=normal seed=2 days=9 policy=care plots=4
 day  season  weather   temp planted ready dead moist tank  money  harv kg    earned score objective
 1    spring  sunny     20   0       0     0    0     56    60     0    0     0      0     open
-7    summer  heatwave  36   4       0     0    0.438 160   60     0    0     0      0     open
-10   autumn  rain      10   4       0     0    0.978 160   171.34 3    5.98  51.34  128   done
+6    summer  sunny     31   4       0     0    0.889 160   189.33 3    7.65  69.33  147.16 done
+10   autumn  cloudy    14   3       0     0    0.746 160   205.8  4    10.25 85.8   147.16 done
+
+actions=88 valid=88 invalid=0 water_used=80L harvests=4 (10.25 kg) earned=$85.8 score=147.16
 ```
 
-`--policy care` runs a simple farmer (fill can → water dry plots → harvest →
-sell), `--policy idle` does nothing. `--csv out.csv` writes the daily table.
-The runner is also what the golden tests reuse, so the numbers in a paper and
-the numbers in the tests come from the same policy.
+The objective is done on day 6 (`3 harvests`), the bonus is paid into `money` and
+the fourth harvest on day 10 only adds `earned`/`harvests` - the `score` column
+lags one tick there, because `metrics.score` is refreshed by the tick loop rather
+than by the action (see [Scoring](#scoring-the-points-an-agent-earns); the live
+value after day 10 is `85.8 + 8*4 + 0.5*10.25 + 50 = 172.93`). `--policy care`
+runs a simple farmer (fill can → water dry plots → harvest → sell), `--policy
+idle` does nothing. `--csv out.csv` writes the daily table. The runner is also
+what the golden tests reuse, so the numbers in a paper and the numbers in the
+tests come from the same policy.
 
 ## Tests
 

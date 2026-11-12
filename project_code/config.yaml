@@ -30,3 +30,17 @@ server_urls:
   farm_sim_url: http://127.0.0.1:3111
   whisper_url: http://hal9000.skim.th-owl.de:8003/transcribe
   ollama_url: http://hal9000.skim.th-owl.de:11430
+
+# OpenAI-compatible server used by `--vllm` (vLLM behind the DGX proxy). The
+# model id is the one the server lists under /v1/models - `--model` still wins,
+# and is taken from `model` here when the flag is used without it.
+vllm:
+  base_url: https://llm-proxy-dgx.skim.th-owl.de
+  api_key: sk-QB2QKC9IuaSdqBvPy6dnpg
+  model: Qwen/Qwen3.8-27B
+  # Qwen3 reasons for a long time before its first tool call unless the template
+  # is told not to; false keeps a turn inside --llm-timeout. `null` (or deleting
+  # the key) sends no chat_template_kwargs at all - use that for models whose
+  # template has no `enable_thinking` switch (gemma, ...).
+  enable_thinking: false
+

@@ -40,7 +40,6 @@ import logging
 import yaml
 import os
 import sys
-from speech_to_text import audio_text
 import queue
 import threading
 import copy
@@ -643,42 +642,11 @@ points_gained = 0
 points_gained_object = {}
 player_positions = []
 create_logger_file(f"system_prompt_")
-# system_prompt = f"""You are a smart farm game agent.
-
-# DIRECTIVES & TASK ORDER:
-# 1. If water_available is False: Path to water tank at (75, 250) -> follow_path -> call collect_water().
-# 2. Process crops sequentially in the exact order listed below:
-#    For each crop needing work: Path to (x, y) -> follow_path -> plant_crop(x, y) -> water().
-# 3. Finish ONLY when all crops are planted and watered AND water_available is True.
-
-# CRITICAL RULES:
-# - THINKING LIMIT: Keep reasoning under 2 sentences. Focus ONLY on the immediate next action. Do NOT output multi-step plans or summaries.
-# - EXECUTION: Execute exactly 1 tool call per turn. Never output text descriptions of tool calls.
-
-# WORLD STATE:
-# Grid size: {state['grid_size']}
-# Player position: {tuple(state['player_pos'])}
-
-# Crops:
-# {crops_to_text(state['crops'])}
-
-# Obstacles:
-# {list(state['obstacles'])}
-
-# Water_available: {state["water_available"]}
-# Water_tank: {list(state['water_tank'])}
-
-# {tools_description}"""
 
 messages = [
     {'role': 'system', 'content': system_prompt},
     {'role': 'user', 'content': new_content}
 ]
-
-# client = Client(
-#     host=config_data["server_urls"]["ollama_url"],
-#     timeout=60
-# )
 
 client = OpenAI(
     base_url="https://llm-proxy-dgx.skim.th-owl.de",  # vLLM server endpoint
@@ -749,40 +717,13 @@ for iteration in range(MAX_ITERATIONS):
         messages = messages[:2] + messages[-24:]
 
     st_time = time.time()
-    # response: ChatResponse = client.chat(model=model, messages=messages, tools=[
-    #                                      follow_path, water, collect_water, plant_crop], think=False)
+
     extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
     response: ChatResponse = client.chat.completions.create(
         model="Qwen/Qwen3.8-27B", tools=tools, messages=messages, extra_body=extra_body)
 
-    # print(f"input_tokens: {response['prompt_eval_count']}")
-
-    # print("Prompt evaluation time:",
-    #         response["prompt_eval_duration"] / 1e9, "seconds")
-    # logger.info(
-    #     f"Prompt evaluation time:{response['prompt_eval_duration'] / 1e9:.2f}")
-
-    # print("Generation time:", response["eval_duration"] / 1e9, "seconds")
-    # logger.info(f"Generation time: {response['eval_duration'] / 1e9:.2f}")
-
-    # print(f"output_tokens: {response['eval_count']}")
-
-    # total_output_tokens += response['eval_count']
-    # total_input_tokens = response['prompt_eval_count']
-    # print(f"response time: {(response['total_duration']/1e9)}")
-    # logger.info(f"response time: {response['total_duration'] / 1e9:.2f}")
     msg = response.choices[0].message
-    # if response.message.content:
-    #     print('Content: ')
-    #     print(response.message.content + '\n')
-    #     logger.info(f"content : {response.message.content}")
 
-    # if response.message.thinking:
-    #     print('Thinking: ')
-    #     print(response.message.thinking + '\n')
-    #     logger.info(f"thinking : {response.message.thinking}")
-
-    # messages.append(response.message)
     if msg.tool_calls:
         for tool_call in msg.tool_calls:
             # LLM decides which function to call
