@@ -1,68 +1,32 @@
-"""Tools - every tool is one POST /api/v1/action, nothing is simulated locally.
+"""Tools - every tool is one action on the server, nothing is simulated locally.
 
 Each wrapper only names its action and its arguments; the server owns the rules
 and answers with the fresh observation. The docstrings are the tool descriptions
 the model reads, so they are written for the model, not for a developer.
+
+One call is one `POST /api/v1/action`, and the wrapper turns the answer into the
+JSON string the model reads. A turn may order several calls; they are executed in
+that order, one request each, and each answer is read against the state that call
+left behind. The model cannot react between the calls of its own turn (the
+assistant message that ordered them is already written), so the harness never
+merges, reorders or retries them: the model's plan is the plan.
 """
 
 import json
 import logging
 import time
+
 from . import runtime
 from .api import api_get, api_post
 from .budget import clamp_advance, requested_ticks
 from .tracking import track_position
-import queue
-import copy
-import requests
-import threading
 
 logger = logging.getLogger(__name__)
 
-headers = {
-    "Content-Type": "application/json"
-}
-
-task_queue = queue.Queue()
+#: Directions `move` accepts; anything else is refused here, without a round trip.
+MOVE_DIRECTIONS = ("up", "down", "left", "right")
 
 
-def api_worker():
-    print("API worker started")
-    while True:
-        try:
-            # 1. Try to get a task
-            # state_snapshot = task_queue.get(timeout=15)
-            payload = task_queue.get(timeout=15)
-        except queue.Empty:
-            print("No more tasks. Worker exiting.")
-            break
-        try:
-            time.sleep(0.25)
-            # requests.post(url, json=state_snapshot, headers=headers)
-            api_post("/api/v1/action", payload, include_state=True)
-        except Exception as e:
-            print(f"Error in API call: {e}")
-        finally:
-            # 3. Mark THIS specific task as done
-            task_queue.task_done()
-
-
-t = threading.Thread(target=api_worker)
-t.start()
-
-
-def api_call(current_state):
-    # Parse crops and format the state
-    # new_crops = crops_parser(current_state["crops"])
-    # player_positions.append(current_state["player_pos"])
-    # Create a deep copy so future LLM moves don't overwrite this data
-    # before the background thread has a chance to send it
-    state_to_send = copy.deepcopy(current_state)
-    # state_to_send["crops"] = new_crops
-
-    # Push to background thread instantly
-    task_queue.put(state_to_send)
-    
 def progressless(data):
     """True when an action claimed success but the farmer did not move at all.
 
@@ -75,7 +39,7 @@ def progressless(data):
 
 
 def call_action(payload, note=None):
-    """Send one action, refresh `state` and return the result as a JSON string.
+    """Run one action and return the reply as the JSON string the model reads.
 
     The reply keeps the shape the legacy tools used (`status` / `action` /
     `message`) so the same evaluation code can read both experiments, plus the
@@ -89,49 +53,75 @@ def call_action(payload, note=None):
     # tile=null targets the faced tile), so absent is not the same as null.
     payload = {key: value for key, value in payload.items() if value is not None}
     started = time.time()
+    result = send(payload, action)
+    return json.dumps(apply_result(payload, result, note, time.time() - started))
+
+
+def reject(action, reason, message):
+    """Fail a call locally, without spending a round trip, and book-keep the refusal."""
+    runtime.invalid_moves += 1
+    runtime.invalid_move_object[reason] = runtime.invalid_move_object.get(reason, 0) + 1
+    print(f"tool {action} -> ok=False reason={reason} message={message!r} (refused locally)")
+    logger.info(f"tool: {action} refused locally: {reason} - {message}")
+    return json.dumps({"status": "false", "action": action, "message": message,
+                       "reason": reason, "data": {}})
+
+
+def send(payload, action):
+    """POST one action; an HTTP failure becomes a failed reply, never an exception."""
     try:
-        # result = api_post("/api/v1/action", payload, include_state=True)
-        api_call(payload)
+        return api_post("/api/v1/action", payload, include_state=True)
     except Exception as exc:
-        runtime.invalid_moves += 1
-        runtime.invalid_move_object["transport error"] = (
-            runtime.invalid_move_object.get("transport error", 0) + 1)
         logger.error(f"tool: {action} failed over HTTP: {exc}")
-        return json.dumps({"status": "false", "action": action, "message": f"transport error: {exc}"})
+        return {"ok": False, "reason": "transport error",
+                "message": f"transport error: {exc}", "data": {}}
 
-    # if isinstance(result.get("state"), dict):
-    #     runtime.state = result.pop("state")
 
-    # ok = bool(result.get("ok"))
-    # reply = {
-    #     "status": "true" if ok else "false",
-    #     "action": action,
-    #     "message": result.get("message") or "",
-    #     "data": result.get("data") or {},
-    # }
-    # if note:
-    #     reply["note"] = note
-    # if ok and progressless(reply["data"]):
-    #     # The reply said "walked 0 of N tiles" and reported success: nothing moved,
-    #     # so the call must not be counted as a valid action nor handed back as one.
-    #     ok = False
-    #     reply["status"] = "false"
-    #     reply["reason"] = "NO_PROGRESS"
-    #     reply["message"] = (f"{reply['message']} Nothing moved - the farmer is out of "
-    #                         "energy. Call `rest` before walking again.")
-    # if not ok:
-    #     reason = reply.get("reason") or result.get("reason") or "UNKNOWN_ACTION"
-    #     reply["reason"] = reason
-    #     runtime.invalid_moves += 1
-    #     runtime.invalid_move_object[reason] = runtime.invalid_move_object.get(reason, 0) + 1
+def apply_result(payload, result, note, tool_time):
+    """Build the reply for one server result and book-keep it.
 
-    # track_position(action)
-    # tool_time = time.time() - started
-    # print(f"tool {action} -> ok={ok} reason={reply.get('reason')} "
-    #       f"message={reply['message']!r} ({tool_time:.3f}s)")
-    # logger.info(f"tool: {action} args={json.dumps({k: v for k, v in payload.items() if k != 'type'})} "
-    #             f"result: {json.dumps(reply)} tool_time={tool_time:.3f}s")
-    # return json.dumps(reply)
+    Every action ends up here, in call order, so `invalid_moves`, `tool_calls`,
+    `time_taken`, `visited`/`revisits`/`jumps` and `player_positions` are booked in
+    exactly one place. `tool_time` is how long that call's request took, booked
+    here because this is the only layer that knows when the server answered (the
+    loop used to book the whole LLM step as tool latency).
+    """
+    action = str(payload.get("type", "?"))
+    if isinstance(result.get("state"), dict):
+        runtime.state = result.pop("state")
+
+    ok = bool(result.get("ok"))
+    reply = {
+        "status": "true" if ok else "false",
+        "action": action,
+        "message": result.get("message") or "",
+        "data": result.get("data") or {},
+    }
+    if note:
+        reply["note"] = note
+    if ok and progressless(reply["data"]):
+        # The reply said "walked 0 of N tiles" and reported success: nothing moved,
+        # so the call must not be counted as a valid action nor handed back as one.
+        ok = False
+        reply["status"] = "false"
+        reply["reason"] = "NO_PROGRESS"
+        reply["message"] = (f"{reply['message']} Nothing moved - the farmer is out of "
+                            "energy. Call `rest` before walking again.")
+    if not ok:
+        reason = reply.get("reason") or result.get("reason") or "UNKNOWN_ACTION"
+        reply["reason"] = reason
+        runtime.invalid_moves += 1
+        runtime.invalid_move_object[reason] = runtime.invalid_move_object.get(reason, 0) + 1
+    else:
+        runtime.tool_calls.append(action)
+        runtime.time_taken.append(tool_time)
+
+    track_position(action)
+    print(f"tool {action} -> ok={ok} reason={reply.get('reason')} "
+          f"message={reply['message']!r} ({tool_time:.3f}s)")
+    logger.info(f"tool: {action} args={json.dumps({k: v for k, v in payload.items() if k != 'type'})} "
+                f"result: {json.dumps(reply)} tool_time={tool_time:.3f}s")
+    return reply
 
 
 def move(dir: str = None) -> str:
@@ -140,18 +130,12 @@ def move(dir: str = None) -> str:
     Args:
         dir: 'up', 'down', 'left' or 'right'.
     """
-    if dir not in ["up","down","left","right"]:
-        return {
-            "status": "false",
-            "action": "move",
-            "message": 'invalid tool argument, the arument should be one of ["up","down","left","right"]',
-        }
-    call_action({"type": "move", "dir": dir})
-    return  {
-            "status": "true",
-            "action": "move",
-            "message": "move successful",
-        }
+    if dir is not None and str(dir).strip().lower() not in MOVE_DIRECTIONS:
+        # Refused here, not by the server: a typo used to cost a round trip and came
+        # back as BAD_ARGS without naming the four directions the model may send.
+        return reject("move", "BAD_ARGS",
+                      f"Unknown direction {dir!r} - use one of {', '.join(MOVE_DIRECTIONS)}.")
+    return call_action({"type": "move", "dir": dir})
 
 
 def move_to(tile=None, steps: int = None) -> str:
@@ -316,6 +300,9 @@ def advance(minutes: int = None, ticks: int = None) -> str:
         ticks: ticks to skip.
     """
     requested = requested_ticks(minutes, ticks)
+    # Clamped against the clock the harness has just read: every call is applied as
+    # it is made, so a second `advance` in the same turn sees the first one's result
+    # and cannot push the world past the objective deadline.
     allowed, note = clamp_advance(requested)
     if note:
         print(f"advance capped: requested {requested} tick(s), applied {allowed} ({note})")

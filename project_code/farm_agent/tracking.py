@@ -26,6 +26,8 @@ def reset_tracking():
     runtime.time_taken = []
     runtime.total_input_tokens = 0
     runtime.total_output_tokens = 0
+    runtime.llm_calls = 0
+    runtime.tool_calls_sent = 0
     runtime.stop_reason = ""
     runtime.STEPS_USED = 0
 

@@ -52,35 +52,43 @@ def ollama_url():
     return (runtime.config_data.get("server_urls") or {}).get("ollama_url")
 
 
-def vllm_config():
-    """`vllm:` block of config.yaml - the OpenAI-compatible server of `--vllm`."""
-    return runtime.config_data.get("vllm") or {}
+#: The two OpenAI-compatible blocks of config.yaml. `--vllm` is the vLLM behind the
+#: DGX proxy, `--nvidia` the hosted NIM endpoint; both answer `/v1/chat/completions`
+#: with `choices[0].message`, so `agent.run_agent_openai` is written once and only the
+#: four values below differ per backend.
+OPENAI_BLOCKS = ("vllm", "nvidia")
 
 
-def vllm_base_url():
-    """`vllm.base_url` without a trailing slash ('' when the key is missing)."""
-    return str(vllm_config().get("base_url") or "").rstrip("/")
+def openai_config(backend="vllm"):
+    """`vllm:` or `nvidia:` block of config.yaml ({} when the key is missing)."""
+    return runtime.config_data.get(backend) or {}
 
 
-def vllm_api_key():
-    """`vllm.api_key`; the OpenAI SDK wants *some* key, even a placeholder."""
-    return vllm_config().get("api_key") or "EMPTY"
+def openai_base_url(backend="vllm"):
+    """`<backend>.base_url` without a trailing slash ('' when the key is missing)."""
+    return str(openai_config(backend).get("base_url") or "").rstrip("/")
 
 
-def vllm_model():
-    """`vllm.model` - the served model id, used when `--vllm` comes without --model."""
-    return vllm_config().get("model")
+def openai_api_key(backend="vllm"):
+    """`<backend>.api_key`; the OpenAI SDK wants *some* key, even a placeholder."""
+    return openai_config(backend).get("api_key") or "EMPTY"
 
 
-def vllm_enable_thinking():
-    """`vllm.enable_thinking`: None means "send no chat_template_kwargs at all"."""
-    return vllm_config().get("enable_thinking")
+def openai_model(backend="vllm"):
+    """`<backend>.model` - the served id, used when the flag comes without --model."""
+    return openai_config(backend).get("model")
+
+
+def openai_enable_thinking(backend="vllm"):
+    """`<backend>.enable_thinking`: None means "send no chat_template_kwargs at all"."""
+    return openai_config(backend).get("enable_thinking")
 
 
 def llm_endpoint(args):
-    """Where the run sends its prompts: the vLLM proxy (`--vllm`) or Ollama."""
-    if args.vllm:
-        return vllm_base_url() or "(vllm.base_url missing in config.yaml)"
+    """Where the run sends its prompts: NVIDIA NIM, the vLLM proxy or Ollama."""
+    if args.backend != "ollama":
+        return (openai_base_url(args.backend)
+                or f"({args.backend}.base_url missing in config.yaml)")
     return ollama_url()
 
 
@@ -132,15 +140,25 @@ def parse_args(argv=None):
                              "objective deadline")
     parser.add_argument("--check-api", action="store_true",
                         help="skip the LLM and drive the API with a fixed script (smoke test)")
-    parser.add_argument("--vllm", action="store_true",
-                        help="send the prompts to the OpenAI-compatible server in the "
-                             "`vllm:` block of config.yaml instead of Ollama (model "
-                             "defaults to `vllm.model` when --model is omitted)")
+    llm = parser.add_mutually_exclusive_group()
+    llm.add_argument("--vllm", action="store_true",
+                     help="send the prompts to the OpenAI-compatible server in the "
+                          "`vllm:` block of config.yaml instead of Ollama (model "
+                          "defaults to `vllm.model` when --model is omitted)")
+    llm.add_argument("--nvidia", action="store_true",
+                     help="the same loop against the hosted NVIDIA NIM endpoint in the "
+                          "`nvidia:` block of config.yaml (model defaults to "
+                          "`nvidia.model` when --model is omitted)")
     args = parser.parse_args(argv)
-    # `--vllm` may take its model id from config.yaml; `--model` still wins, so an
-    # explicit Ollama model is never silently swapped for the served one.
-    if args.vllm and not args.model:
-        args.model = vllm_model()
+    # Which of the three backends this run talks to. `--check-api` needs none, but the
+    # summary records it either way, and `agent.run_agent_openai` reads it to pick the
+    # config.yaml block it talks to.
+    args.backend = "vllm" if args.vllm else "nvidia" if args.nvidia else "ollama"
+    # An OpenAI-compatible backend may take its model id from config.yaml; `--model`
+    # still wins, so an explicit Ollama model is never silently swapped for the served
+    # one.
+    if args.backend != "ollama" and not args.model:
+        args.model = openai_model(args.backend)
     if not args.check_api and not args.list_objectives and not args.model:
         parser.error("--model is required unless --check-api or --list-objectives is used")
 

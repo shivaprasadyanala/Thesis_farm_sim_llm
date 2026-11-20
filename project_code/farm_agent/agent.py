@@ -1,4 +1,4 @@
-"""The agentic loop - same shape for both backends (Ollama and vLLM)."""
+"""The agentic loop - same shape for every backend (Ollama, vLLM, NVIDIA NIM)."""
 
 import json
 import logging
@@ -9,7 +9,7 @@ from ollama._types import ChatResponse
 from openai import BadRequestError, OpenAI
 
 from . import runtime
-from .config import ollama_url, vllm_api_key, vllm_base_url, vllm_enable_thinking
+from .config import ollama_url, openai_api_key, openai_base_url, openai_enable_thinking
 from .episode import resolve_task
 from .prompt import build_system_message, tool_arguments
 from .rendering import state_to_text
@@ -44,8 +44,11 @@ def run_agent(args, schemas):
             # Kept at module level so `budget_to_text` can report what is left in the
             # observation the model reads after this step's action.
             runtime.STEPS_USED = i
-            st_time = time.time()
             response: ChatResponse = client.chat(model=args.model, messages=messages, tools=schemas)
+            # One completion per turn - what `no_of_llm_calls` reports in the summary. It
+            # used to be `len(time_taken)`, i.e. the tool calls that *succeeded*, which
+            # made a 60-turn episode look like a run of 56 model calls.
+            runtime.llm_calls += 1
 
         
             print(f"input_tokens: {response['prompt_eval_count']}")
@@ -78,6 +81,11 @@ def run_agent(args, schemas):
                 silent_steps = 0
                 print("llm tool_calls:")
                 print(len(response.message.tool_calls))
+                runtime.tool_calls_sent += len(response.message.tool_calls)
+                # Every call is a request of its own, in the order the model asked for
+                # them: the wrapper sends, book-keeps and answers in one step, so the
+                # reply goes straight into the `tool` message below.
+                answers = []
                 for tool_call in response.message.tool_calls:
                     # The LLM decides which wrapper to call, we never repair its plan.
                     name = tool_call.function.name
@@ -107,18 +115,15 @@ def run_agent(args, schemas):
                         runtime.invalid_move_object[key] = (
                             runtime.invalid_move_object.get(key, 0) + 1)
                         print(f'Tool {name} not found')
-                        messages.append({'role': 'tool', 'content': f'Tool {name} not found',
-                                         'tool_name': name})
-                        continue
+                        real_result_json = json.dumps({"status": "false", "action": name,
+                                                       "message": f'Tool {name} not found'})
+                    answers.append((name, json.loads(real_result_json)))
 
-                    print(f"time for tool {name}: {str(time.time() - st_time)}")
-                    if json.loads(real_result_json).get("status") == "true":
-                        runtime.tool_calls.append(name)
-                        runtime.time_taken.append(time.time() - st_time)
+                for name, reply in answers:
                     messages.append({
                         "role": "tool",
                         "content": json.dumps({
-                            "action_result": json.loads(real_result_json),
+                            "action_result": reply,
                             "current_state": state_to_text(runtime.state),
                         }),
                         "tool_name": name,
@@ -240,16 +245,15 @@ def message_get(message, field):
     return value
 
 
-def chat_completion(client, model, messages, schemas, step):
-    """One completion, with the Qwen3 `enable_thinking` switch when configured.
+def chat_completion(client, model, messages, schemas, step, thinking=None):
+    """One completion, with the template's `enable_thinking` switch when configured.
 
-    vLLM renders the model's own chat template, so `enable_thinking` travels as a
-    template kwarg instead of a request field. A model whose template has no such
-    switch (gemma, ...) answers 400, and that is not a failed step: the same prompt
-    is resent without the kwarg.
+    The server renders the model's own chat template, so `enable_thinking` travels as
+    a template kwarg instead of a request field - the same wire format for vLLM and
+    for NVIDIA NIM. A model whose template has no such switch (gemma, ...) answers
+    400, and that is not a failed step: the same prompt is resent without the kwarg.
     """
     request = {"model": model, "messages": messages, "tools": schemas}
-    thinking = vllm_enable_thinking()
     if thinking is not None:
         request["extra_body"] = {"chat_template_kwargs": {"enable_thinking": bool(thinking)}}
     try:
@@ -263,22 +267,28 @@ def chat_completion(client, model, messages, schemas, step):
         return client.chat.completions.create(**request)
 
 
-def run_agent_vllm(args, schemas):
-    """The loop of `run_agent`, against an OpenAI-compatible server (`--vllm`).
+def run_agent_openai(args, schemas):
+    """The loop of `run_agent`, against an OpenAI-compatible server.
 
-    Only the transport differs: vLLM answers `/v1/chat/completions` with
-    `choices[0].message`, wants the assistant turn and every tool result echoed as
-    plain dicts (`tool_calls` / `tool_call_id`), and reports tokens in `usage`
-    instead of Ollama's `prompt_eval_count` / `eval_count`. Prompt, tools, nudges
-    and stop reasons are the same, so a vLLM episode stays comparable with an
+    `args.backend` picks the block of config.yaml: `vllm` (the DGX proxy) or `nvidia`
+    (the hosted NIM endpoint). Only the transport differs: both answer
+    `/v1/chat/completions` with `choices[0].message`, want the assistant turn and every
+    tool result echoed as plain dicts (`tool_calls` / `tool_call_id`), and report tokens
+    in `usage` instead of Ollama's `prompt_eval_count` / `eval_count`. Prompt, tools,
+    nudges and stop reasons are the same, so such an episode stays comparable with an
     Ollama one.
     """
-    if not vllm_base_url():
-        print("--vllm needs `vllm.base_url` in config.yaml, e.g. "
-              "https://llm-proxy-dgx.skim.th-owl.de")
-        logger.error("--vllm without vllm.base_url in config.yaml")
+    backend = getattr(args, "backend", None) or "vllm"
+    base_url = openai_base_url(backend)
+    if not base_url:
+        example = ("https://integrate.api.nvidia.com/v1" if backend == "nvidia"
+                   else "https://llm-proxy-dgx.skim.th-owl.de")
+        print(f"--{backend} needs `{backend}.base_url` in config.yaml, e.g. {example}")
+        logger.error(f"--{backend} without {backend}.base_url in config.yaml")
         runtime.stop_reason = "llm_error"
         return
+
+    thinking = openai_enable_thinking(backend)
 
     # The prompt and the first user turn both carry the task; `--task` overrides
     # it, otherwise it is the objective this preset assigns (never empty, which is
@@ -293,19 +303,14 @@ def run_agent_vllm(args, schemas):
     logger.info(f"task: {task_text}")
     logger.info(f"system message: {system_message2}")
 
-    client = OpenAI(base_url=vllm_base_url(), api_key=vllm_api_key(),
+    client = OpenAI(base_url=base_url, api_key=openai_api_key(backend),
                     timeout=args.llm_timeout)
-    print(f"vllm: {vllm_base_url()} model={args.model} "
-          f"thinking={vllm_enable_thinking()}")
-    logger.info(f"vllm: {vllm_base_url()} model={args.model} "
-                f"thinking={vllm_enable_thinking()}")
+    print(f"{backend}: {base_url} model={args.model} thinking={thinking}")
+    logger.info(f"{backend}: {base_url} model={args.model} thinking={thinking}")
 
     silent_steps = 0  # consecutive model turns without a tool call
     stuck_repeats = 0  # consecutive identical tool calls
     last_signature = None
-    total_time_taken = 0.0
-    episode_start_time = time.time()
-    
     try:
         i = 0
         while i < args.max_steps:
@@ -315,9 +320,9 @@ def run_agent_vllm(args, schemas):
             runtime.STEPS_USED = i
             st_time = time.time()
             messages = trim_history(messages)
-            response = chat_completion(client, args.model, messages, schemas, i)
+            response = chat_completion(client, args.model, messages, schemas, i, thinking)
+            runtime.llm_calls += 1
             step_time = time.time() - st_time
-            total_time_taken+=step_time
             message = response.choices[0].message
 
             usage = getattr(response, "usage", None)
@@ -353,6 +358,11 @@ def run_agent_vllm(args, schemas):
                 silent_steps = 0
                 print("llm tool_calls:")
                 print(len(message.tool_calls))
+                runtime.tool_calls_sent += len(message.tool_calls)
+                # Every call is a request of its own, in the order the model asked for
+                # them: the wrapper sends, book-keeps and answers in one step, so the
+                # reply goes straight into the `tool` message below.
+                answers = []
                 for index, tool_call in enumerate(message.tool_calls):
                     # The LLM decides which wrapper to call, we never repair its plan.
                     name = tool_call.function.name
@@ -385,22 +395,18 @@ def run_agent_vllm(args, schemas):
                         runtime.invalid_move_object[key] = (
                             runtime.invalid_move_object.get(key, 0) + 1)
                         print(f'Tool {name} not found')
-                        messages.append({'role': 'tool', 'tool_call_id': call_id,
-                                         'content': f'Tool {name} not found'})
-                        continue
+                        real_result_json = json.dumps({"status": "false", "action": name,
+                                                       "message": f'Tool {name} not found'})
+                    answers.append((call_id, json.loads(real_result_json)))
 
-                    print(
-                        f"time for tool {name}: {str(time.time() - st_time)}")
-                    if json.loads(real_result_json).get("status") == "true":
-                        runtime.tool_calls.append(name)
-                        runtime.time_taken.append(time.time() - st_time)
+                for call_id, reply in answers:
                     # `tool_call_id` is what ties the answer to the call above; a
                     # result without it is a 400 on the next request.
                     messages.append({
                         "role": "tool",
                         "tool_call_id": call_id,
                         "content": json.dumps({
-                            "action_result": json.loads(real_result_json),
+                            "action_result": reply,
                             "current_state": state_to_text(runtime.state),
                         }),
                     })
@@ -467,16 +473,18 @@ def run_agent_vllm(args, schemas):
         runtime.stop_reason = "llm_error"
         logger.error(f"LLm failed due to error: {str(e)}")
         print(f"llm failed due to error: {e}")
-        # Two usual causes: `vllm.base_url` is unreachable or `vllm.model` is not
-        # served, or the deployment has no tool calling enabled (vLLM needs
-        # `--enable-auto-tool-choice --tool-call-parser <name>`, and the proxy then
-        # answers 400 "auto tool choice requires ..."). Either way no tool call was
-        # ever sent, so the game looks untouched.
-        print(f"model server: {vllm_base_url()} (config.yaml vllm.base_url) - is it up, "
+        # Two usual causes: `<backend>.base_url` is unreachable or `<backend>.model`
+        # is not served, or the deployment has no tool calling enabled (vLLM needs
+        # `--enable-auto-tool-choice --tool-call-parser <name>`, and NIM only accepts
+        # `tools` for models whose card lists tool calling). Either way no tool call
+        # was ever sent, so the game looks untouched.
+        print(f"model server: {base_url} (config.yaml {backend}.base_url) - is it up, "
               f"does /v1/models list '{args.model}', and does that deployment serve tools?")
         print("nothing was posted to the game after the last tool call above")
-        logger.error(f"model server: {vllm_base_url()} model={args.model}")
-    finally:
-        queue_finish_time = time.time()
-        true_end_to_end_latency = queue_finish_time - episode_start_time
-        logger.info(f"total time taken by tools: {total_time_taken:.2f} seconds")
+        logger.error(f"model server: {base_url} model={args.model}")
+
+
+#: `--vllm` entry point kept by name (the experiments drive the loops directly). Both
+#: OpenAI-compatible backends are the one loop above, told apart by `args.backend`.
+def run_agent_vllm(args, schemas):
+    return run_agent_openai(args, schemas)

@@ -9,7 +9,7 @@ lives:
     legacy baseline (port 3000)     farm-sim baseline (this file)
     ------------------------------  ------------------------------------------
     hand-maintained ``state`` dict  server state  (GET  /api/v1/state)
-    python rules inside the tools   server rules  (POST /api/v1/action)
+    python rules inside the tools   server rules  (POST /api/v1/action[s])
     posts its world back            never posts state, only actions
     hand-written tool list          tool catalogue (GET  /api/v1/tools)
 
@@ -28,7 +28,7 @@ module per concern:
     farm_agent/objectives.py   objective catalogue, validation, verification
     farm_agent/episode.py      reset / adopt an episode, resolve the task text
     farm_agent/served.py       the served constants the prompt may quote
-    farm_agent/tools.py        the action wrappers + the tool schemas sent to the model
+    farm_agent/tools.py        the action wrappers and the tool schemas
     farm_agent/prompt.py       the system message
     farm_agent/agent.py        the LLM loop, once per backend (Ollama, vLLM)
     farm_agent/check_api.py    the scripted smoke test (no LLM)

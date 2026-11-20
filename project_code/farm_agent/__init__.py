@@ -11,13 +11,13 @@ Module map (data flows the same way it did in the single file):
 
     runtime      mutable run state - the old module-level globals live here
     config       config.yaml, argparse, log file setup
-    api          the HTTP layer (GET /api/v1/state, POST /api/v1/action)
+    api          the HTTP layer (POST /api/v1/action, GET /api/v1/state)
     tracking     visited tiles, jumps, revisits and the per-episode reset
     budget       ticks/minutes, the `budget:` line and the `advance` clamp
     rendering    the "CURRENT STATE" block the model reads
     objectives   objective catalogue, validation, post-reset verification
     served       served constants (crop economics, preset values) for the prompt
-    tools        one wrapper per action plus the Ollama tool schemas
+    tools        one wrapper per action and the tool schemas
     prompt       the system message and tool-argument decoding
     agent        the LLM loop
     check_api    the scripted smoke test that needs no LLM

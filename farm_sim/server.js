@@ -68,6 +68,15 @@ const wantState = (req) => {
   return flag === true || flag === '1' || flag === 'true';
 };
 
+// Per-action observations for `POST /api/v1/actions`: a caller that applies a whole
+// turn at once still has to see the world after *each* action (the path the farmer
+// walked, the tile it stands on after every step), which is what N single-action
+// calls return. `include_state` stays the cheaper "just tell me where I ended up".
+const wantActionStates = (req) => {
+  const flag = req.query.include_states !== undefined ? req.query.include_states : req.body && req.body.include_states;
+  return flag === true || flag === '1' || flag === 'true';
+};
+
 const statePayload = (extra = {}) => ({ ...extra, state: sim.observe({ events: 6 }) });
 
 app.get('/', (req, res) => {
@@ -130,9 +139,19 @@ app.post('/api/v1/actions', (req, res) => {
       message: 'Send an array of actions or {actions: [...]}.',
     });
   }
-  const results = list.slice(0, 50).map((action) => sim.act(action));
+  // `sim.act` applies the list in order, so one request carrying a whole turn
+  // produces the same sequence of world states as N single-action requests:
+  // `results[i]` is the answer the i-th call would have received on its own.
+  const each = wantActionStates(req);
+  const results = list.slice(0, 50).map((action) => {
+    const result = sim.act(action);
+    if (each) result.state = sim.observe({ events: 0 });
+    return result;
+  });
   broadcast(true);
-  return res.json({ ok: results.every((r) => r.ok), count: results.length, results });
+  const body = { ok: results.every((r) => r.ok), count: results.length, results };
+  if (wantState(req)) body.state = sim.observe({ events: 6 });
+  return res.json(body);
 });
 
 app.post('/api/v1/advance', (req, res) => {

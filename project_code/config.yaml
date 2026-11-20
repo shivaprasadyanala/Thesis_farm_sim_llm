@@ -44,3 +44,19 @@ vllm:
   # template has no `enable_thinking` switch (gemma, ...).
   enable_thinking: false
 
+nvidia:
+  # Hosted NVIDIA NIM (build.nvidia.com). It speaks the same OpenAI-compatible API
+  # as the DGX proxy, so `--nvidia` reuses the `--vllm` loop and only these values
+  # differ. `GET /v1/models` with this key lists what it may call, and `--model`
+  # still wins over `model` here.
+  base_url: https://integrate.api.nvidia.com/v1
+  api_key: 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
+  # Any id that key can call and whose model card lists tool calling. Checked here
+  # against /v1/models: `openai/gpt-oss-20b` answers `tool_calls` and accepts the
+  # chat_template_kwargs below; `meta/llama-3.3-70b-instruct` style ids are the
+  # alternative. NIM serves no Qwen build, which is why this default is gpt-oss.
+  model: openai/gpt-oss-20b
+  # Same switch as `vllm.enable_thinking` (`false` = ask the template to skip the
+  # reasoning trace, `null` = send no chat-template kwargs at all).
+  enable_thinking: false
+

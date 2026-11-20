@@ -191,7 +191,15 @@ def summarise_run(args, stem):
         "metrics": metrics,
         "points_gained": points_gained,
         "points_gained_object": points_gained_object,
-        "no_of_llm_calls": len(runtime.time_taken),
+        # One completion per model *turn* (`no_of_llm_calls` - the number `--max-steps`
+        # bounds), next to the tool calls those turns asked for. The old
+        # `no_of_llm_calls` was `len(time_taken)`, i.e. the tool calls that succeeded,
+        # which made a 60-turn / 60-call run look like 56 model calls.
+        "no_of_llm_calls": runtime.llm_calls,
+        "no_of_tool_calls": len(runtime.time_taken),
+        "tool_calls_sent": runtime.tool_calls_sent,
+        "tool_calls_per_turn": round(runtime.tool_calls_sent / max(1, runtime.llm_calls), 2),
+        "llm_backend": getattr(args, "backend", "ollama"),
         "total_input_tokens": runtime.total_input_tokens,
         "total_output_tokens": runtime.total_output_tokens,
         "tool_calls": runtime.tool_calls,

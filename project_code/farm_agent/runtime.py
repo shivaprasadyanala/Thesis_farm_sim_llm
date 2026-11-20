@@ -63,6 +63,11 @@ tool_calls = []            # names of the tool calls that succeeded
 time_taken = []            # wall-clock seconds per successful tool call
 total_input_tokens = 0
 total_output_tokens = 0
+# One chat completion per model *turn* - the unit `--max-steps` bounds - and every
+# tool call those turns asked for. The two are reported separately because a turn
+# can order more than one call while `no_of_llm_calls` counts turns, not calls.
+llm_calls = 0
+tool_calls_sent = 0
 stop_reason = ""           # how the last episode ended (written to the summary)
 
 # ---------------------------------------------------------------------------

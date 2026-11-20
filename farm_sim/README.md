@@ -244,8 +244,21 @@ map edge only.
 `tile` always accepts `[x, y]`, `{x, y}` or a `plot_id` (`"p07"`); when omitted
 the action applies to the plot you stand on, otherwise to the tile you face.
 
-`POST /api/v1/actions` accepts an array (max 50) and returns all results, which
-is handy for replaying a recorded trajectory.
+`POST /api/v1/actions` takes `{actions: [...]}` (or a bare array, max 50) and
+applies the list in order, which is how an agent can spend a whole turn in one
+round trip instead of one request per action. The reply carries one result per
+entry, in the same order:
+
+* `{include_state: true}` → `state` with the observation after the last action
+  (cheap: one observation for the whole turn).
+* `{include_states: true}` → `results[i].state` with the observation after that
+  action, exactly what the i-th single `POST /api/v1/action` would have returned.
+  Use it when the caller has to follow the farmer's path tile by tile; combine it
+  with `include_state` to also get the closing observation with its event list.
+
+Both flags are also accepted as query parameters (`?include_state=1`). The Python
+harness drives the single-action route (`POST /api/v1/action`) and does not use
+this endpoint; it stays for replaying recorded trajectories and for other clients.
 
 ### State
 
@@ -270,7 +283,7 @@ deadline, state), `metrics`, the last events and the crop catalog.
 | GET | `/api/v1/objectives` | objective catalogue: `id`, `label`, `text`, `deadline_day`, `reward` |
 | GET | `/api/v1/state` | full observation (`?events=0` to trim) |
 | POST | `/api/v1/action` | one action (`include_state: true` echoes the state) |
-| POST | `/api/v1/actions` | batch of actions |
+| POST | `/api/v1/actions` | batch of actions (`include_state`, `include_states`) |
 | POST | `/api/v1/advance` | `{minutes}` or `{ticks}` fast-forward |
 | POST | `/api/v1/reset` | `{seed, preset, task, objective, speed}` new episode |
 | POST | `/api/v1/pause` | `{paused}` |

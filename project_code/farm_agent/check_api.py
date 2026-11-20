@@ -8,7 +8,6 @@ before an experiment is spent on it.
 
 import json
 import logging
-import time
 
 from . import runtime
 from .episode import prepare_episode
@@ -27,13 +26,14 @@ def find_plot(tile):
 
 
 def run_check_step(steps, name, function_to_call, **arguments):
-    """Call a wrapper, record it like the agent loop does and keep the reply."""
-    started = time.time()
+    """Run one wrapper and keep its reply for the pass/fail check.
+
+    The wrapper does its own round trip (`POST /api/v1/action`) and returns the
+    answer the model would read, so a scripted step is exactly what one call of a
+    model turn costs.
+    """
     reply = json.loads(function_to_call(**arguments))
     steps.append((name, reply))
-    if reply.get("status") == "true":
-        runtime.tool_calls.append(name)
-        runtime.time_taken.append(time.time() - started)
     return reply
 
 

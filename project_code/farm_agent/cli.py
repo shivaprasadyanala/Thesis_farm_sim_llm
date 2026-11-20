@@ -60,7 +60,7 @@ def main(argv=None):
     print(f"log file: {log_path}")
     logger.info(f"farm-sim base url: {runtime.base_url}")
     logger.info(api.describe_server(health))
-    logger.info(f"Running model: {args.model}")
+    logger.info(f"Running model: {args.model} (backend: {args.backend})")
     logger.info(f"args: {vars(args)}")
     # Recorded in the log, not just in the prompt: a server restarted with other
     # constants makes every number below stale, and this is where that shows.
@@ -93,7 +93,9 @@ def main(argv=None):
     logger.info(f"initial state:\n{rendering.state_to_text(runtime.state)}")
 
     started = time.time()
-    runner = agent.run_agent_vllm if args.vllm else agent.run_agent
+    # Ollama keeps its own loop; both OpenAI-compatible backends (`--vllm` and
+    # `--nvidia`) share one, and `args.backend` tells it which config block to read.
+    runner = agent.run_agent if args.backend == "ollama" else agent.run_agent_openai
     runner(args, schemas)
     reporting.summarise_run(args, stem)
 
