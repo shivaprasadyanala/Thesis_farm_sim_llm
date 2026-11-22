@@ -81,7 +81,9 @@ def main(argv=None):
     logger.info(f"step budget: {runtime.MAX_STEPS} LLM step(s), reported in every observation")
 
     if args.check_api:
+        started = time.time()
         exit_code = check_api.run_scripted_check(args)
+        runtime.episode_seconds = time.time() - started
         reporting.summarise_run(args, stem)
         return exit_code
 
@@ -97,10 +99,14 @@ def main(argv=None):
     # `--nvidia`) share one, and `args.backend` tells it which config block to read.
     runner = agent.run_agent if args.backend == "ollama" else agent.run_agent_openai
     runner(args, schemas)
+    # Recorded before the summary is written: `episode_time` is the agent loop
+    # (every model turn plus every action request), not the bookkeeping around it -
+    # the health check, the reset, the schema fetch and the plots are outside it.
+    runtime.episode_seconds = time.time() - started
     reporting.summarise_run(args, stem)
 
-    print(f"episode finished in {time.time() - started:.1f}s")
-    logger.info(f"episode finished in {time.time() - started:.1f}s")
+    print(f"episode finished in {runtime.episode_seconds:.1f}s (agent loop)")
+    logger.info(f"episode finished in {runtime.episode_seconds:.1f}s (agent loop)")
 
     if args.reset_after:
         episode.prepare_episode(args)

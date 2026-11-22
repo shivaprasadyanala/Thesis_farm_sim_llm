@@ -60,7 +60,13 @@ invalid_move_object = {}
 revisits = 0
 jumps = 0
 tool_calls = []            # names of the tool calls that succeeded
+#: Three clocks, kept apart on purpose. `time_taken` is one server action
+#: (`POST /api/v1/action`), `llm_time_taken` is one chat completion, and
+#: `episode_seconds` is the whole agent loop - they are not interchangeable (the
+#: legacy baseline booked the LLM step as tool latency).
 time_taken = []            # wall-clock seconds per successful tool call
+llm_time_taken = []        # wall-clock seconds per chat completion (one per turn)
+episode_seconds = 0.0      # agent-loop wall clock of the last episode
 total_input_tokens = 0
 total_output_tokens = 0
 # One chat completion per model *turn* - the unit `--max-steps` bounds - and every

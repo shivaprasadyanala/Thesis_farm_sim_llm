@@ -24,12 +24,14 @@ def reset_tracking():
     runtime.jumps = 0
     runtime.tool_calls = []
     runtime.time_taken = []
+    runtime.llm_time_taken = []
     runtime.total_input_tokens = 0
     runtime.total_output_tokens = 0
     runtime.llm_calls = 0
     runtime.tool_calls_sent = 0
     runtime.stop_reason = ""
     runtime.STEPS_USED = 0
+    runtime.episode_seconds = 0.0
 
 
 def track_position(action):

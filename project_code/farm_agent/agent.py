@@ -44,7 +44,12 @@ def run_agent(args, schemas):
             # Kept at module level so `budget_to_text` can report what is left in the
             # observation the model reads after this step's action.
             runtime.STEPS_USED = i
+            # Client-side clock around the completion: `total_duration` below is what
+            # the server measured (prefill + decode), this one also carries queueing
+            # and the network - it is what `llm_time_taken` reports.
+            turn_started = time.time()
             response: ChatResponse = client.chat(model=args.model, messages=messages, tools=schemas)
+            runtime.llm_time_taken.append(time.time() - turn_started)
             # One completion per turn - what `no_of_llm_calls` reports in the summary. It
             # used to be `len(time_taken)`, i.e. the tool calls that *succeeded*, which
             # made a 60-turn episode look like a run of 56 model calls.
@@ -57,8 +62,10 @@ def run_agent(args, schemas):
             print("Generation time:", response["eval_duration"] / 1e9, "seconds")
             logger.info(f"Generation time: {response['eval_duration'] / 1e9:.2f}")
             print(f"output_tokens: {response['eval_count']}")
-            print(f"response time: {(response['total_duration'] / 1e9)}")
-            logger.info(f"step {i} response time: {(response['total_duration'] / 1e9):.2f}s")
+            print(f"response time: {runtime.llm_time_taken[-1]:.2f}s "
+                  f"(server {response['total_duration'] / 1e9:.2f}s)")
+            logger.info(f"step {i} response time: {runtime.llm_time_taken[-1]:.2f}s "
+                        f"(server {response['total_duration'] / 1e9:.2f}s)")
 
             runtime.total_output_tokens += response['eval_count'] or 0
             runtime.total_input_tokens += response['prompt_eval_count'] or 0
@@ -323,6 +330,7 @@ def run_agent_openai(args, schemas):
             response = chat_completion(client, args.model, messages, schemas, i, thinking)
             runtime.llm_calls += 1
             step_time = time.time() - st_time
+            runtime.llm_time_taken.append(step_time)
             message = response.choices[0].message
 
             usage = getattr(response, "usage", None)

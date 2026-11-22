@@ -75,6 +75,31 @@ def print_step_order(sequence):
     return first_seen, ordered
 
 
+def latency_stats(values):
+    """mean/median/variance/std_dev/min/max of a list of seconds (``{}`` if empty).
+
+    One helper for every clock the summary reports (`time_taken`, one server action;
+    `llm_time_taken`, one chat completion), so the columns built from them cannot
+    end up describing different statistics.
+    """
+    if not values:
+        return {}
+    data = list(values)
+    return {
+        "mean": float(np.mean(data)),
+        "median": float(np.median(data)),
+        "variance": float(np.var(data)),
+        "std_dev": float(np.std(data)),
+        "min": float(np.min(data)),
+        "max": float(np.max(data)),
+    }
+
+
+def per_call(total, count):
+    """``total / count`` in seconds (3 dp), or ``None`` when nothing was called."""
+    return round(total / count, 3) if count else None
+
+
 def summarise_run(args, stem):
     """Collect the episode metrics, write the latency plot and the JSON summary."""
     refresh_state()
@@ -95,25 +120,38 @@ def summarise_run(args, stem):
     points_gained = metrics.get("score", 0)
 
     stats = {}
+    llm_stats = latency_stats(runtime.llm_time_taken)
     tool_calls_final = []
     step_order = {}
     invalid_move_rate = 0.0
 
+    # The model clock stands on its own: an episode can call the model 60 times and
+    # post nothing (a run that only talks), or post 60 actions in a handful of turns.
+    # Reporting it inside the tool-call branch used to hide the first case.
+    if runtime.llm_time_taken:
+        print(f"LLM requests: {len(runtime.llm_time_taken)} at {llm_stats['mean']:.2f}s mean "
+              f"({llm_stats['min']:.2f}s..{llm_stats['max']:.2f}s)")
+        logger.info(f"llm time taken stats: {json.dumps(llm_stats)}")
+        plt.figure()
+        plt.plot(runtime.llm_time_taken)
+        plt.xlabel("LLM request")
+        plt.ylabel("seconds")
+        plt.title(f"{args.model or 'check_api'} - LLM latency, {args.preset} seed {args.seed}")
+        llm_plot_path = os.path.join(args.log_folder, f"{stem}_llm_latency.png")
+        plt.savefig(llm_plot_path)
+        plt.close()
+        print(f"LLM latency plot: {llm_plot_path}")
+        logger.info(f"LLM latency plot: {llm_plot_path}")
+
     print(runtime.time_taken)
     if len(runtime.time_taken) > 0 and len(runtime.tool_calls) > 0:
-        data = runtime.time_taken
-        stats = {
-            "mean": float(np.mean(data)),
-            "median": float(np.median(data)),
-            "variance": float(np.var(data)),
-            "std_dev": float(np.std(data)),
-            "min": float(np.min(data)),
-            "max": float(np.max(data)),
-        }
+        stats = latency_stats(runtime.time_taken)
 
-        print("No of llms calls:-")
+        # `time_taken` is booked per *successful* tool call, so this is the action
+        # count; the model-call count is `no_of_llm_calls` (one per turn).
+        print("No of successful tool calls:-")
         print(len(runtime.time_taken))
-        logger.info(f"No of llms calls: {len(runtime.time_taken)}")
+        logger.info(f"No of successful tool calls: {len(runtime.time_taken)}")
         logger.info(f"time taken stats: {json.dumps(stats)}")
 
         print("player positions:")
@@ -207,6 +245,16 @@ def summarise_run(args, stem):
         "step_order": step_order,
         "time_taken": runtime.time_taken,
         "time_taken_stats": stats,
+        # Three clocks side by side, because they answer different questions: one
+        # chat completion (`llm_time_taken`), one successful server action
+        # (`time_taken`) and the whole agent loop (`episode_time`). The legacy
+        # baseline booked the LLM step as tool latency, so its `time_taken` is not
+        # this `time_taken`.
+        "llm_time_taken": runtime.llm_time_taken,
+        "llm_time_taken_stats": llm_stats,
+        "episode_time": round(runtime.episode_seconds, 3),
+        "episode_time_per_llm_call": per_call(runtime.episode_seconds, runtime.llm_calls),
+        "episode_time_per_tool_call": per_call(runtime.episode_seconds, len(runtime.time_taken)),
         "invalid_moves": runtime.invalid_moves,
         "invalid_move_object": runtime.invalid_move_object,
         "invalid_move_rate": invalid_move_rate,

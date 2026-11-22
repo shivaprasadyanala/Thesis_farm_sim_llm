@@ -34,7 +34,7 @@ model reads a compact digest of that state on its next turn.
 | `agentic_approach_baseline_farm_sim.py` | the thin entry point (docstring = the long-form notes); `python -m farm_agent` runs the same `main` |
 | `farm_agent/` | the harness, one module per concern (see [Module map](#module-map)) |
 | `config.yaml` | server URLs, the `vllm:` and `nvidia:` blocks, legacy keys |
-| `../experiments/test_logs_baseline_farm_sim/` | `.log`, `_latency.png`, `_summary.json` of every run (`--log-folder`) |
+| `../experiments/test_logs_baseline_farm_sim/` | `.log`, `_latency.png` (per action), `_llm_latency.png` (per model turn), `_summary.json` of every run (`--log-folder`) |
 
 ## Quick start
 

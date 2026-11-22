@@ -1,0 +1,25 @@
+# Models a catalogue batch runs when `--model all` is passed.
+#
+# One list per backend, in the order the batch runs them. `all` is deliberately a
+# *curated* list and not "everything the endpoint serves": a hosted NIM key can
+# call dozens of models, and an unattended matrix multiplies that by
+# tasks x levels x prompts x repeats. `--model <id>` always overrides this file,
+# and `--models-file` points at another one.
+#
+# The pre-flight of every batch compares this list with what the endpoint reports
+# (`GET /api/tags` on Ollama, `GET /v1/models` on vLLM/NIM) and warns about ids it
+# cannot see, so a renamed tag shows up before the first episode fails.
+ollama:
+  - qwen3:8b
+  - gpt-oss:20b
+  - nemotron-3-nano:4b
+  - gemma4:26b
+  - Qwen3.8-27B
+
+vllm:
+  - Qwen/Qwen3.8-27B
+  - google/gemma-4-26B-A4B-it
+
+nvidia:
+  - openai/gpt-oss-20b
+  - meta/llama-3.3-70b-instruct
