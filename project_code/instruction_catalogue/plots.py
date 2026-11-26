@@ -1,4 +1,4 @@
-"""Figures for a batch: task completion and the three latency clocks.
+"""Figures for a batch: task completion, the three latency clocks, the GPU cost.
 
 Reads the per-episode ``_summary.json`` files of a batch folder (never the logs -
 the JSON is what the harness guarantees) and writes one set of PNGs per model:
@@ -12,13 +12,34 @@ the JSON is what the harness guarantees) and writes one set of PNGs per model:
 plus ``latency_completion.csv``, the aggregated numbers behind the figures (one
 row per model x preset x task x level).
 
-Two rules the figures follow, both inherited from `results`:
+A batch that was measured with ``gpu_energy_cons.py`` carries a
+``gpu_energy_logs/`` tree next to its summaries (`gpu_logs`), and the same call
+then also writes, per model:
+
+* ``energy`` - joules per episode, joules per point gained, and the watts the card
+  held (the run's mean, its highest sample);
+* ``energy_series`` - power and cumulative energy against the run's own clock, one
+  thin line per run, straight from the series the agent wrote.
+
+The tree is `gpu_logs.root`, so ``A_LEMS_GPU_LOGS`` moves the figures with the data;
+the energy figures are named after the sanitised model id like every other figure
+here, which is also the name of the model's folder in the tree.
+
+No energy tables are written here: ``gpu_energy_logs/`` already holds the wide
+table, the sample table and the per-cell means, and a second copy of the same
+numbers is a second copy that can disagree.
+
+Three rules the figures follow, all inherited from `results`:
 
 1. an episode the backend answered with ``llm_error`` never *played*, so it is
    excluded from the completion rate and from every latency mean - it is counted
    as ``err`` instead, which is why the bars are annotated ``k/n`` and not ``k/total``;
 2. the three latency scopes are never mixed onto one axis: one chat completion,
-   one ``POST /api/v1/action``, one whole agent loop are different units.
+   one ``POST /api/v1/action``, one whole agent loop are different units;
+3. energy is drawn *gross* (``energy_j``, envelope to envelope) and never on an
+   axis with watts; ``net_energy_j`` - the cost above the idle baseline - is a
+   different question and stays in the tables, and a run that produced no joule
+   figure is a gap in the figure, never a free zero.
 
 Two ways in, both ending in the same ``main``::
 
@@ -46,9 +67,9 @@ if __package__ in (None, ""):
     # are imported through the package - whose parent folder (``project_code``)
     # must be on sys.path regardless of the working directory.
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from instruction_catalogue import instructions, results
+    from instruction_catalogue import gpu_logs, instructions, results
 else:
-    from . import instructions, results
+    from . import gpu_logs, instructions, results
 
 #: ``<repo>/experiments/instruction_catalogue`` - where the documented batch
 #: invocations write. Resolved from this file, not from the cwd, so a bare
@@ -174,6 +195,35 @@ def _sem(values):
     return (variance / len(numbers)) ** 0.5
 
 
+def _sd(values):
+    """Sample standard deviation (0 for a single value, ``None`` for none).
+
+    The energy bars carry this whisker instead of a SEM: one phrasing that costs
+    0.5x and one that costs 2x average to a number that describes neither, and the
+    spread is the finding - not an uncertainty about it.
+    """
+    numbers = [value for value in values if isinstance(value, (int, float))]
+    if not numbers:
+        return None
+    if len(numbers) == 1:
+        return 0.0
+    mean = sum(numbers) / len(numbers)
+    return (sum((value - mean) ** 2 for value in numbers) / (len(numbers) - 1)) ** 0.5
+
+
+def _number(value):
+    """A float from a recorded cell, or ``None`` for an empty/unparsable one.
+
+    The energy rows come back from JSON, where a run that never closed its
+    envelope has ``""`` where a joule figure would be - and ``""`` must not be
+    read as zero.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _cell_stats(items):
     """The numbers one bar stands for: completion, score, the three clocks."""
     played = [item for item in items if item["played"]]
@@ -207,21 +257,24 @@ def _cell_stats(items):
     }
 
 
+def _task_rank(task):
+    """Catalogue order of a task, unknown tasks last (matrix stability)."""
+    task_order = list(instructions.TASK_OBJECTIVES)
+    return task_order.index(task) if task in task_order else len(task_order)
+
+
+def _preset_rank(preset):
+    """Preset order (``default, easy, normal, hard``), unknown presets last."""
+    return (PRESET_ORDER.index(preset) if preset in PRESET_ORDER
+            else len(PRESET_ORDER))
+
+
 def aggregate(episodes):
     """``results[model][(preset, task)][level]`` -> `_cell_stats` of that cell.
 
     Ordered by preset, then by catalogue task order, then by level, so the figures
     of two models (or two batches) line up bar for bar.
     """
-    task_order = list(instructions.TASK_OBJECTIVES)
-
-    def task_rank(task):
-        return task_order.index(task) if task in task_order else len(task_order)
-
-    def preset_rank(preset):
-        return (PRESET_ORDER.index(preset) if preset in PRESET_ORDER
-                else len(PRESET_ORDER))
-
     grouped = {}
     for episode in episodes:
         cell = (episode["preset"], episode["task"])
@@ -231,14 +284,96 @@ def aggregate(episodes):
     models = OrderedDict()
     for model, cells in grouped.items():
         ordered = OrderedDict()
-        for cell in sorted(cells, key=lambda item: (preset_rank(item[0]),
-                                                    task_rank(item[1]), item[1])):
+        for cell in sorted(cells, key=lambda item: (_preset_rank(item[0]),
+                                                    _task_rank(item[1]), item[1])):
             levels = OrderedDict()
             for level in level_order(cells[cell]):
                 levels[level] = _cell_stats(cells[cell][level])
             ordered[cell] = levels
         models[model] = ordered
     return models
+
+
+def _energy_cell_stats(items):
+    """The numbers one energy bar stands for, over a cell's recorded runs.
+
+    A run that died before its envelope closed still counts in ``n`` - the cell was
+    attempted - but contributes no joule figure, so ``n_ok`` next to ``n`` is what
+    says a mean is built from fewer runs than the cell planned. ``net_energy_j`` is
+    kept as a number, not drawn: it is the cost above the idle baseline, which only
+    exists when a baseline was taken and answers a different question than the
+    gross draw a lab meter would see.
+    """
+    completed = sum(1 for item in items if item.get("completed") is True)
+    played = [item for item in items
+              if item.get("stop_reason") not in results.FAILED_STOP_REASONS]
+    peaks = [_number(item.get("peak_power_w")) for item in items]
+    peaks = [value for value in peaks if value is not None]
+    return {
+        "n": len(items),
+        "n_ok": sum(1 for item in items if str(item.get("exit_code")) == "0"),
+        "played": len(played),
+        "errors": len(items) - len(played),
+        "completed": completed,
+        "completion_rate": (100.0 * completed / len(played) if played else None),
+        "mean_energy_j": _mean([_number(item.get("energy_j")) for item in items]),
+        "sd_energy_j": _sd([_number(item.get("energy_j")) for item in items]),
+        "mean_net_energy_j":
+            _mean([_number(item.get("net_energy_j")) for item in items]),
+        "mean_avg_power_w": _mean([_number(item.get("avg_power_w")) for item in items]),
+        "peak_power_w": max(peaks) if peaks else None,
+        "mean_j_per_point": _mean([_number(item.get("j_per_point")) for item in items]),
+        "mean_j_per_llm_call":
+            _mean([_number(item.get("j_per_llm_call")) for item in items]),
+        "mean_episode_time": _mean([_number(item.get("episode_time")) for item in items]),
+        "mean_points": _mean([_number(item.get("points")) for item in items]),
+        "episodes": items,
+    }
+
+
+def energy_cells(rows):
+    """``{(preset, task): {level: stats}}`` of one model's rows - `aggregate`'s shape.
+
+    Built from the recorded run rows and not from ``energy_by_cell.csv``: that table
+    averages the presets of a task together, and two worlds are not the same
+    experiment. The rows carry every matrix coordinate, so the energy bars line up
+    with the completion bars of the same cell without a join.
+    """
+    grouped = {}
+    for row in rows:
+        cell = (str(row.get("preset") or "unknown"), str(row.get("task", "")))
+        grouped.setdefault(cell, {}).setdefault(str(row.get("level", "")),
+                                                []).append(row)
+
+    cells = OrderedDict()
+    for cell in sorted(grouped, key=lambda item: (_preset_rank(item[0]),
+                                                  _task_rank(item[1]), item[1])):
+        levels = OrderedDict()
+        for level in level_order(grouped[cell]):
+            levels[level] = _energy_cell_stats(grouped[cell][level])
+        cells[cell] = levels
+    return cells
+
+
+def collect_series(log_folder, rows):
+    """``{run: (level, samples)}`` of the runs whose series is still in the tree.
+
+    Read through the row's own ``series`` column (`gpu_logs.series_path`) and not
+    from ``all_gpu_samples.csv``: the tidy table is a convenience a batch may skip
+    (``--no-samples``), while the copy next to the record is the evidence itself.
+    A run measured while the mount was not visible has no copy and is simply not
+    one of the lines - its joules are still in the bars.
+    """
+    series = OrderedDict()
+    for row in rows:
+        path = gpu_logs.series_path(log_folder, row)
+        if not path or not os.path.isfile(path):
+            continue
+        samples, _ = gpu_logs.series_rows(path)
+        if samples:
+            series[str(row.get("run") or os.path.basename(path))] = (
+                str(row.get("level", "")), samples)
+    return series
 
 
 def _bar_offset(count, index, step):
@@ -565,6 +700,131 @@ def plot_tradeoff(model, cells, path, dpi=150):
     return _save(figure, path, dpi)
 
 
+#: The three energy panels: (stat, spread used as whisker, label format, unit, title).
+ENERGY_SPECS = (("mean_energy_j", "sd_energy_j", "{:,.0f}", "joules",
+                 "energy per episode (gross draw, whisker = sd)"),
+                ("mean_j_per_point", None, "{:,.1f}", "joules per point",
+                 "energy per point gained (lower is better)"),
+                ("mean_avg_power_w", None, "{:.0f}", "watts",
+                 "mean power (bar), highest sample (tick)"))
+
+
+def plot_energy(model, cells, path, dpi=150):
+    """What an episode costs: joules, joules per point, and the watts it held.
+
+    Three panels, same x axis. ``energy_j`` is the whole episode envelope - the
+    number a meter at the wall would see - with the sd of the repeats as whisker:
+    a wording that costs 0.5x and one that costs 2x average to a number that
+    describes neither. The middle panel is the cost per point gained, the energy
+    figure that stays comparable across a task a model sometimes fails; the right
+    panel is the mean power the run held, with its highest sample over it, so a
+    throttled or idling card is visible next to a busy one.
+
+    A cell whose attempts did not all produce a figure is annotated ``k/n``: a mean
+    built from two of three runs is then visible instead of merely lower.
+    """
+    groups = list(cells)
+    levels = levels_of(cells)
+    step = _step(len(levels))
+    positions = list(range(len(groups)))
+    offsets = {level: [position + _bar_offset(len(levels), index, step)
+                       for position in positions]
+               for index, level in enumerate(levels)}
+
+    figure, axes = plt.subplots(1, 3, figsize=(17.5, 5.0), constrained_layout=True)
+    figure.suptitle(f"{model} - what an episode costs (mean over the repeats)",
+                    fontsize=12)
+
+    for axis, (key, spread_key, fmt, unit, title) in zip(axes, ENERGY_SPECS):
+        recorded = False
+        for level in levels:
+            color = LEVEL_COLORS.get(level, "#333333")
+            stats = [cells[group].get(level) for group in groups]
+            heights = [cell[key] if cell and cell[key] is not None else 0.0
+                       for cell in stats]
+            recorded = recorded or any(heights)
+            errors = ([(cell[spread_key] or 0.0) if cell else 0.0 for cell in stats]
+                      if spread_key else None)
+            bars = axis.bar(offsets[level], heights, step, label=level, color=color,
+                            edgecolor="white", yerr=errors, capsize=2,
+                            error_kw={"elinewidth": 0.8, "ecolor": "0.3"})
+            texts = []
+            for cell in stats:
+                if not cell or cell[key] is None:
+                    texts.append(None)
+                    continue
+                text = fmt.format(cell[key])
+                if axis is axes[0] and cell["n_ok"] != cell["n"]:
+                    # Only where something went wrong: a partial mean must not look
+                    # like a cell that measured every attempt it planned.
+                    text += f"\n{cell['n_ok']}/{cell['n']}"
+                texts.append(text)
+            anchors = ([height + (error or 0.0) for height, error in zip(heights, errors)]
+                       if errors else None)
+            _label_bars(axis, bars, texts, anchor=anchors)
+            if spread_key is None and axis is axes[2]:
+                peaks = [cell["peak_power_w"] if cell and cell["peak_power_w"]
+                         else 0.0 for cell in stats]
+                axis.scatter(offsets[level], peaks, marker="_", s=70, color="0.15",
+                             linewidth=1.2, zorder=3)
+        _clean(axis, unit)
+        axis.set_title(title, fontsize=10)
+        _headroom(axis)
+        if not recorded:
+            # A measured batch can still hold a cell with no figure at all: the
+            # envelope never closed, or the episode died before it ran.
+            axis.text(0.5, 0.5, "no energy recorded", transform=axis.transAxes,
+                      ha="center", va="center", fontsize=10, color="0.45")
+            axis.set_ylim(0, 1)
+    axes[0].legend(title="wording", fontsize=8, title_fontsize=8, frameon=False,
+                   loc="upper left", ncol=len(levels))
+    for axis in axes:
+        axis.set_xticks(positions)
+        axis.set_xticklabels([cell_label(group) for group in groups], fontsize=8,
+                             rotation=12, ha="right", rotation_mode="anchor")
+        axis.set_xlim(-0.6, len(groups) - 0.4)
+    return _save(figure, path, dpi)
+
+
+def plot_energy_series(model, series, path, dpi=150):
+    """Power and cumulative energy of every measured run, on its own clock.
+
+    Two panels, one x axis (seconds since the run's first sample), because watts and
+    joules are different units: the left says how hard the card was driven, the
+    right what that added up to. A run whose right-hand line is already tall at
+    t = 0 paid for its model load before the agent loop started; a run whose left
+    line sits at the idle baseline while its episode clock runs was waiting on the
+    network, not on the GPU. Colour is the wording, so a level that costs more is
+    recognisable from run to run.
+    """
+    levels = level_order({level for level, _ in series.values()})
+    figure, axes = plt.subplots(1, 2, figsize=(14.0, 5.2), constrained_layout=True)
+    figure.suptitle(f"{model} - GPU power and cumulative energy of "
+                    f"{len(series)} measured run(s)", fontsize=12)
+    for _run, (level, samples) in series.items():
+        style = {"color": LEVEL_COLORS.get(level, "#333333"), "linewidth": 1.0,
+                 "alpha": 0.55}
+        if len(samples) < 2:
+            style.update({"marker": "o", "markersize": 3})  # one sample is a dot
+        elapsed = [sample["elapsed_s"] for sample in samples]
+        axes[0].plot(elapsed, [sample["power_w"] for sample in samples], **style)
+        axes[1].plot(elapsed, [sample["energy_j"] for sample in samples], **style)
+
+    for axis, ylabel, title in zip(axes, ("power (W)", "cumulative energy (J)"),
+                                   ("how hard the card was driven",
+                                    "what the episode added up to")):
+        _clean(axis, ylabel)
+        axis.set_title(title, fontsize=10)
+        axis.set_xlabel("seconds since the run's first sample", fontsize=9)
+        if axis.get_xlim()[1] > 0:  # a single sample at t = 0 has no extent
+            axis.set_xlim(left=0)
+    handles = [Line2D([], [], color=LEVEL_COLORS.get(level, "#333333"),
+                      linewidth=1.4, label=level) for level in levels]
+    axes[0].legend(handles=handles, title="wording", fontsize=8, title_fontsize=8,
+                   frameon=False, loc="best")
+    return _save(figure, path, dpi)
+
+
 #: Columns of ``latency_completion.csv`` - the aggregated numbers behind the bars.
 AGGREGATE_FIELDS = ("model", "preset", "task", "level", "episodes", "played", "errors",
                     "completed", "completion_rate", "mean_points", "mean_llm_calls",
@@ -598,6 +858,12 @@ def write(log_folder, out_folder=None, dpi=150):
     The figures are per model (a batch may hold several), written into
     ``<log_folder>/figures`` unless ``out_folder`` says otherwise, and named after
     the sanitised model id so two models never overwrite each other.
+
+    A batch that was measured with ``gpu_energy_cons.py`` also gets the energy
+    figures per model (the series one only where the runs still have their CSV); a
+    plain batch has no ``gpu_energy_logs/``, so `gpu_logs.episode_rows` returns
+    nothing and the same call draws exactly what it always drew - the energy figures
+    are additive, never a second command.
     """
     log_folder = os.path.abspath(log_folder)
     episodes = collect(log_folder)
@@ -605,12 +871,23 @@ def write(log_folder, out_folder=None, dpi=150):
         print(f"no episode summaries under {log_folder} - nothing to plot")
         return []
     models = aggregate(episodes)
+
+    # Keyed by the sanitised id: the tree's folders are named with
+    # `instructions.model_folder`, the summaries by whatever id the child recorded,
+    # and both go through the same sanitiser the batch folder uses.
+    measured = OrderedDict()
+    for row in gpu_logs.episode_rows(log_folder):
+        measured.setdefault(
+            instructions.model_folder(str(row.get("model", ""))), []).append(row)
+
     out_folder = os.path.abspath(out_folder or os.path.join(log_folder, "figures"))
     os.makedirs(out_folder, exist_ok=True)
 
     paths = []
+    plotted_keys = set()
     for model, cells in models.items():
         stem = os.path.join(out_folder, instructions.sanitise(model))
+        plotted_keys.add(instructions.sanitise(model))
         paths.append(plot_completion(model, cells, f"{stem}_completion.png", dpi=dpi))
         paths.append(plot_latency(model, cells, f"{stem}_latency.png", dpi=dpi))
         paths.append(plot_tradeoff(model, cells, f"{stem}_tradeoff.png", dpi=dpi))
@@ -619,6 +896,23 @@ def write(log_folder, out_folder=None, dpi=150):
         plotted = sum(cell["n"] for levels in cells.values() for cell in levels.values())
         print(f"{model}: {plotted} episode(s), {len(cells)} preset/task "
               f"pair(s), {bars} bar(s)")
+        runs = measured.get(instructions.model_folder(model))
+        if not runs:
+            continue
+        paths.append(plot_energy(model, energy_cells(runs), f"{stem}_energy.png",
+                                 dpi=dpi))
+        series = collect_series(log_folder, runs)
+        if series:
+            paths.append(plot_energy_series(model, series,
+                                            f"{stem}_energy_series.png", dpi=dpi))
+        print(f"{model}: {len(runs)} measured run(s) with energy, "
+              f"{len(series)} with a series")
+    for key, runs in measured.items():
+        if key not in plotted_keys:
+            # Not an error: a measured run whose summaries were cleaned up, or a
+            # model folder that arrived after this batch's episodes were plotted.
+            print(f"note: {key} has {len(runs)} energy record(s) but no episode "
+                  f"summaries - not plotted")
     print(f"figures: {out_folder}")
     for path in paths:
         print(f"  {os.path.basename(path)}")
@@ -635,7 +929,8 @@ def main(argv=None):
     """
     parser = argparse.ArgumentParser(
         prog="plots.py",
-        description="Plot task completion and the three latency clocks of a "
+        description="Plot task completion, the latency clocks and - for a batch "
+                    "measured with gpu_energy_cons.py - the GPU energy of a "
                     "catalogue batch folder.")
     parser.add_argument("--log-folder", default=DEFAULT_LOG_FOLDER,
                         help="batch folder (or one model's sub-folder) to read "
