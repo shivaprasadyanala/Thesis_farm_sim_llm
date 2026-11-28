@@ -93,7 +93,7 @@ Three clocks per episode, never interchangeable:
 
 | summary field / CSV column | scope | what it times |
 |---|---|---|
-| `llm_time_taken_stats.mean` / `llm_time_taken_mean` | one **LLM request** | client-side wall clock of one chat completion (network + queueing + prefill + decode). One entry per model turn, so `len(llm_time_taken) == no_of_llm_calls`; a retry inside `chat_completion` (template kwarg rejected with 400) is still one turn. |
+| `llm_time_taken_stats.mean` / `llm_time_taken_mean` | one **LLM request** | client-side wall clock of one chat completion (network + queueing + prefill + decode). One entry per attempt, including an attempt that failed on a timeout - a 60 s timeout is a latency, not a missing value - so `len(llm_time_taken) == no_of_llm_calls` holds and both count the same requests (`no_of_llm_calls` is written before the request, so a first-turn failure is `1`, not `0`). The backoff sleep between two attempts is *not* an entry: that is the harness waiting. |
 | `time_taken_stats.mean` / `time_taken_mean` | one **tool call** | round trip of one *successful* `POST /api/v1/action` to the farm server. Invalid moves are counted in `invalid_move_object`, never here. |
 | `episode_time` / `episode_time` | the **whole agent loop** | every model turn plus every action request, from the first `client.chat` to the last tool reply. Excludes the health check, the episode reset, the tool-schema fetch, the summary write and the plots. |
 
@@ -117,6 +117,7 @@ latencies, `<stem>_llm_latency.png` the model latencies.
 | `--list-models` | curated list of every backend in `models.yaml` + what the endpoint now serves |
 | `--list-tasks` | task groups, their levels, prompt counts and resolved preset/objective |
 | `--resume` | skip episodes whose `_summary.json` exists (an interrupted batch continues where it stopped) |
+| `--retry-failed` | with `--resume` (which it turns on): re-run the episodes whose summary records `llm_error` / `check_api_fail` instead of skipping them - a summary file exists for a timed-out episode too - and move the old `.log`/`_summary.json`/plots into `_failed_<stop_reason>/` before the retry overwrites them |
 | `--limit N` | run at most `N` episodes (a cheap prefix of the matrix) |
 | `--fail-fast` | stop at the first episode that did not really run |
 | `--trial-timeout S` | wall-clock cap per episode (`0` = off) |

@@ -116,8 +116,10 @@ def build_parser():
     run = parser.add_argument_group("how to run it")
     run.add_argument("--max-steps", type=int, default=60,
                      help="maximum number of LLM steps per episode")
-    run.add_argument("--llm-timeout", type=float, default=60.0,
-                     help="seconds to wait for one LLM reply per episode")
+    run.add_argument("--llm-timeout", type=float, default=300.0,
+                     help="seconds to wait for one LLM reply per episode (default 300; "
+                          "60 s was too short for a 27B turn over a crowded proxy, and a "
+                          "turn that times out ends the episode as `llm_error`)")
     run.add_argument("--max-advance-ticks", type=int, default=120,
                      help="cap one `advance` call at this many ticks (120 = one day, "
                           "0 = no cap)")
@@ -144,6 +146,11 @@ def build_parser():
                           "`nvidia:` block of config.yaml")
     run.add_argument("--resume", action="store_true",
                      help="skip episodes whose _summary.json already exists")
+    run.add_argument("--retry-failed", action="store_true",
+                     help="with --resume (which it turns on): re-run the episodes whose "
+                          "summary records `llm_error`/`check_api_fail` instead of "
+                          "skipping them, after moving their old artefacts into "
+                          "`_failed_<stop_reason>/` next to the episode")
     run.add_argument("--limit", type=int, default=0,
                      help="stop after this many episodes (0 = the whole matrix)")
     run.add_argument("--fail-fast", action="store_true",
@@ -175,6 +182,12 @@ def parse_args(argv=None):
         parser.error("--max-advance-ticks must be >= 0 (0 turns the cap off)")
     if args.trial_timeout < 0:
         parser.error("--trial-timeout must be >= 0 (0 turns the cap off)")
+    if args.llm_timeout <= 0:
+        parser.error("--llm-timeout must be > 0 (seconds to wait for one LLM reply)")
+    # `--retry-failed` is a refinement of `--resume`, never a second mode: the
+    # episodes it re-runs are the ones `--resume` would skip.
+    if args.retry_failed:
+        args.resume = True
     if args.smoke and args.model:
         parser.error("--smoke runs one scripted episode per task group and takes no "
                      "--model; drop one of the two")

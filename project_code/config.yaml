@@ -31,6 +31,22 @@ server_urls:
   whisper_url: http://hal9000.skim.th-owl.de:8003/transcribe
   ollama_url: http://hal9000.skim.th-owl.de:11430
 
+# Sent with every `/api/chat` request of the Ollama backend. Each key is optional:
+# deleting one sends nothing and leaves the server's own default in charge.
+ollama:
+  # Ollama unloads an idle model after five minutes by default, and reloading a
+  # 17 GB 27B takes longer than one turn may take - that reload is what turned a
+  # whole sweep into `llm_error` on its first turn. `24h` keeps the weights
+  # resident between turns and between episodes; `-1` keeps them loaded forever.
+  keep_alive: "24h"
+  # `false` asks the template to skip the hidden reasoning trace, like
+  # `vllm.enable_thinking: false` (qwen3 otherwise spends the turn thinking).
+  # Use `null` for a model whose template has no thinking switch.
+  think: false
+  # KV-cache size. `null` sends no `options` at all and keeps the server default;
+  # the 42-message history of the loop stays well below 16k tokens either way.
+  num_ctx: null
+
 # OpenAI-compatible server used by `--vllm` (vLLM behind the DGX proxy). The
 # model id is the one the server lists under /v1/models - `--model` still wins,
 # and is taken from `model` here when the flag is used without it.

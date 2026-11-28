@@ -1,14 +1,29 @@
-"""One GPU energy envelope per instruction-catalogue episode.
+"""One energy envelope per instruction-catalogue episode.
 
 ``run_instruction_catalogue.py`` answers *what a model does* with each phrasing of
-the catalogue. This script answers *what that costs*: the NVML agent on the host
-(``host_gpu_agent_nvml.py``) is started before every single episode and stopped
-again right after it::
+the catalogue. This script answers *what that costs*, and it can answer it for the
+GPU, the CPU package, or both around the *same* subprocess.
+
+The GPU is measured from the host, because the container cannot see the card: the
+NVML agent (``host_gpu_agent_nvml.py``) is started before every single episode and
+stopped again right after it::
 
     POST /start?gpu=0&name=<run>   -> run id, method, path of the CSV series
     <one episode subprocess>
     POST /stop?gpu=0               -> energy_j, avg_power_w, duration_s, method,
                                       baseline_w and net_energy_j when known
+
+The CPU is measured from *inside* the container, because the package counter is a
+file of this machine (`measure_cpu_energy.py`; RAPL or ``perf``), so the same
+subprocess runs under a meter object instead of an HTTP agent. ``--cpu-only`` runs
+it alone - no agent, no token, no host process - which is the mode that works on a
+machine whose GPU is being used by someone else; ``--cpu`` runs both envelopes
+around one episode, so the two trees share a ``run`` name and their joules can be
+added up per episode::
+
+    --cpu-only   CPU package only          cpu_energy_logs/
+    --cpu        GPU and CPU, one episode  gpu_energy_logs/ + cpu_energy_logs/
+    (nothing)    GPU only, as before       gpu_energy_logs/
 
 One envelope per episode is the whole point. An envelope around the batch would
 only report the energy of "300 episodes", in which a cheap model and an expensive
@@ -41,10 +56,11 @@ older agent that ignores ``name`` still works (its files keep the timestamped
 
 What lands on disk
 ------------------
-`instruction_catalogue.gpu_logs` owns the layout, so a measured batch folder
+`instruction_catalogue.gpu_logs` owns the layout, `instruction_catalogue.cpu_logs`
+is the same layout with the CPU's root and file names, so a measured batch folder
 carries its energy evidence next to its score tables, grouped by model::
 
-    <log-folder>/gpu_energy_logs/
+    <log-folder>/gpu_energy_logs/                the NVML envelope (--cpu, default)
         all_gpu_logs_per_episode_per_model.csv   one row per episode, every model
         all_gpu_samples.csv                      one row per NVML sample
         energy_by_cell.csv                       mean/sd per model x task x level
@@ -54,43 +70,74 @@ carries its energy evidence next to its score tables, grouped by model::
             <run>.json                           envelope + matrix cell + the row
             <run>.csv                            the time series, copied from the mount
 
+    <log-folder>/cpu_energy_logs/                the package counter (--cpu/--cpu-only)
+        all_cpu_logs_per_episode_per_model.csv   the same columns, CPU joules
+        all_cpu_samples.csv                      one row per RAPL sample
+        energy_by_cell.csv                       the same shape
+        baselines.json                           idle package power
+        <model>/
+            episodes.csv  <run>.json  <run>.csv
+
 The wide table is the one to read: it joins the energy of a run with its points,
 tokens, stop reason and verdict, so "J per point" per model is a column, not a
 notebook. The long table is the one to plot: per-sample power and cumulative
 joules, every run in one file. The per-run ``.json`` is the source of truth - the
 tables are projections of it and can be rebuilt at any time with
-``python -m instruction_catalogue.gpu_logs <log-folder>``. ``A_LEMS_GPU_LOGS``
-points the tree somewhere else (a shared ``telemetry/`` tree) if the batch folder
-is not where the data should live.
+``python -m instruction_catalogue.gpu_logs <log-folder>`` (``--cpu`` for the other
+tree). ``A_LEMS_GPU_LOGS``/``A_LEMS_CPU_LOGS`` point a tree somewhere else (a
+shared ``telemetry/`` tree) if the batch folder is not where the data should live.
+
+Both trees carry the *same row fields*, ``method`` says which instrument answered
+(``nvml_total_energy_counter``/``integrated_power`` against
+``rapl_sysfs_counter``/``perf_stat_energy_pkg``), and ``--cpu`` writes the same
+``run`` into both - so "J of GPU + J of package for this episode" is a join on one
+column.
 
 The host keeps its own timestamped evidence untouched; the copy is what gives the
 batch folder the name the rest of the experiment is indexed by. Once the loop is
 done, the batch's own aggregate of exactly the episodes that were attempted is
 written too (``results.write``), so one folder holds the score table, its energy
-table and the raw series behind both.
+tables and the raw series behind them.
 
 Requirements
 ------------
-The agent must run on the machine with the GPU and be reachable from here, and its
-log folder must be mounted for the CSV copies::
+For the GPU, the agent must run on the machine with the card and be reachable from
+here, and its log folder must be mounted for the CSV copies::
 
     A_LEMS_TOKEN=... python3 host_gpu_agent_nvml.py
     docker run -v ~/alems-telemetry:/telemetry ...
 
+For the CPU, the container needs a counter it may read, and there are two ways::
+
+    docker run -v /sys/class/powercap:/sys/class/powercap:ro ...   # RAPL, no cap
+    docker run --cap-add=PERFMON ...                               # perf (Docker 25+)
+
+``--cpu-only`` needs neither the agent nor ``A_LEMS_TOKEN``. If neither counter is
+usable, the driver refuses before the matrix (exit 3) instead of estimating from
+CPU time x TDP.
+
 Environment:
 
-    A_LEMS_TOKEN         shared secret of the agent (required)
+    A_LEMS_TOKEN         shared secret of the agent (required unless --cpu-only)
     GPU_TELEMETRY_URL    agent base URL (default http://host.docker.internal:8765)
     A_LEMS_GPU           GPU index to measure (default 0)
     GPU_TELEMETRY_DIR    mount point of ~/alems-telemetry (default /telemetry)
-    A_LEMS_BASELINE_S    idle baseline before the matrix, 0 = off (default 10)
-    A_LEMS_GPU_LOGS      root of the log tree (default <log-folder>/gpu_energy_logs)
+    A_LEMS_BASELINE_S    idle GPU baseline before the matrix, 0 = off (default 10)
+    A_LEMS_GPU_LOGS      root of the GPU tree (default <log-folder>/gpu_energy_logs)
+    A_LEMS_CPU_METHOD    auto (default) | rapl | perf | fake
+    A_LEMS_CPU_DOMAINS   package (default), core, dram, uncore, or all
+    A_LEMS_CPU_SOCKET    all (default) or one socket index
+    A_LEMS_CPU_SAMPLE_MS RAPL sampling interval, default 500
+    A_LEMS_CPU_BASELINE_S idle CPU baseline before the matrix, 0 = off (default 10)
+    A_LEMS_CPU_LOGS      root of the CPU tree (default <log-folder>/cpu_energy_logs)
 
 Usage (from ``project_code``, like the batch it wraps)::
 
     python gpu_energy_cons.py --dry-run
     python gpu_energy_cons.py --vllm --levels all --repeats 3
     python gpu_energy_cons.py --model all --limit 2 --resume
+    python gpu_energy_cons.py --cpu-only --model all --limit 2
+    python gpu_energy_cons.py --cpu --model all --resume
 
 Exit codes are the batch's - 0 every attempt ok, 1 an episode failed, 2 invalid
 matrix, 130 interrupted - plus 3 for "the collector cannot measure": then no
@@ -108,10 +155,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import measure_cpu_energy as cpu_meter
 from farm_agent import config as farm_config
-from instruction_catalogue import cli, gpu_logs, instructions, results, runner
+from instruction_catalogue import cli, cpu_logs, gpu_logs, instructions, results, runner
 
 # ---------------------------------------------------------------- settings
+
+#: The two collectors this driver can open around an episode.
+GPU = "gpu"
+CPU = "cpu"
 
 #: Where the agent listens: the host as seen from the dev container. A driver
 #: started on the host itself passes GPU_TELEMETRY_URL=http://127.0.0.1:8765.
@@ -119,7 +171,7 @@ HOST = os.environ.get("GPU_TELEMETRY_URL",
                       "http://host.docker.internal:8765").rstrip("/")
 
 #: The GPU the envelope is taken on (the agent's own variable, same default).
-GPU = int(os.environ.get("A_LEMS_GPU", "0"))
+GPU_INDEX = int(os.environ.get("A_LEMS_GPU", "0"))
 
 #: Where ``~/alems-telemetry`` of the host is mounted here (empty = not mounted).
 TELEMETRY_DIR = os.environ.get("GPU_TELEMETRY_DIR", "/telemetry")
@@ -133,6 +185,39 @@ RETRY_DELAY = 5.0
 
 #: ``/stop`` answers after the last sample and ``/baseline`` sleeps its seconds.
 TIMEOUT = 60.0
+
+
+def parse_collectors(argv):
+    """Split this script's own flags off the batch's argv: ``(collectors, rest)``.
+
+    ``--cpu`` and ``--cpu-only`` are *not* the batch's flags, so they are removed
+    before `cli.parse_args` ever sees them: the plain batch's contract stays
+    exactly what it was, and an unknown-argument error stays an error. Asking for
+    both is a contradiction (the same joules twice with two meanings), so it is
+    refused instead of silently resolved.
+
+    No flag means GPU only, byte for byte what this script has always done.
+    """
+    rest, wanted = [], None
+    for arg in argv:
+        if arg in ("--cpu", "--cpu-only"):
+            if wanted and wanted != arg:
+                print("error: --cpu and --cpu-only are mutually exclusive "
+                      "(--cpu measures both, --cpu-only the package alone)")
+                raise SystemExit(2)
+            wanted = arg
+            continue
+        rest.append(arg)
+    if wanted == "--cpu":
+        return [GPU, CPU], rest
+    if wanted == "--cpu-only":
+        return [CPU], rest
+    return [GPU], rest
+
+
+#: The tree of each collector: the same functions with a different `Layout`, which
+#: is why a row of one can be read by the other's code.
+TREES = {GPU: gpu_logs, CPU: cpu_logs}
 
 
 class CollectorError(RuntimeError):
@@ -209,7 +294,7 @@ def gpu_collector(action, seconds=None, name=None):
     """
     if action == "status":
         return _request("/status", method="GET")
-    query = {"gpu": GPU}
+    query = {"gpu": GPU_INDEX}
     if action == "start" and name:
         query["name"] = name
     if action == "baseline":
@@ -249,7 +334,7 @@ def measuring(run):
         except CollectorError as exc:
             print(f"      gpu: cannot stop the run ({exc})")
             print(f"      gpu: it may still be sampling - POST "
-                  f"{HOST}/stop?gpu={GPU} on the host before the next run")
+                  f"{HOST}/stop?gpu={GPU_INDEX} on the host before the next run")
 
 
 def collector_preflight():
@@ -272,13 +357,13 @@ def collector_preflight():
               f"{counter} | baseline "
               f"{baseline if baseline is not None else '-'} W | active run "
               f"{gpu.get('active_run') or '-'}")
-    target = next((gpu for gpu in gpus if gpu.get("index") == GPU), None)
+    target = next((gpu for gpu in gpus if gpu.get("index") == GPU_INDEX), None)
     if target is None:
-        print(f"error: GPU {GPU} does not exist on the host (it reports "
+        print(f"error: GPU {GPU_INDEX} does not exist on the host (it reports "
               f"{[gpu.get('index') for gpu in gpus]})")
         return False
     if target.get("active_run"):
-        print(f"error: a run is already active on GPU {GPU} "
+        print(f"error: a run is already active on GPU {GPU_INDEX} "
               f"({target['active_run']}); /start would answer 409, and stopping a "
               f"run this script did not open would corrupt its energy - finish it "
               f"on the host first")
@@ -304,6 +389,90 @@ def measure_baseline():
         return None
     print(f"baseline: {reply.get('baseline_w')} W idle over "
           f"{reply.get('seconds')} s - every /stop now also reports net_energy_j")
+    return reply
+
+
+# ---------------------------------------------------------------- the CPU meter
+
+@contextlib.contextmanager
+def measuring_cpu(run, log_folder, model):
+    """The CPU envelope of one run: a sampled package counter around the episode.
+
+    The series is written *inside the tree* under the run's own name, with a
+    ``.partial`` stem while it is being written - a killed batch can then never be
+    mistaken for a complete series, and `cpu_logs.record` copies it into place
+    afterwards. Same division of labour as the GPU's mount and copy, without a
+    mount, because the meter is in this process.
+
+    Yields a dict with the meter, its ``start`` block and - once the block is left -
+    its ``stop`` summary, so the driver sees one shape for both collectors.
+    """
+    target = os.path.join(cpu_logs.model_dir(log_folder, model),
+                          f".{run}.partial.csv")
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    envelope = {"run": run, "start": None, "stop": None, "csv": target,
+                "meter": None}
+    with cpu_meter.meter(target) as meter:
+        envelope["meter"] = meter
+        envelope["start"] = meter.start_info()
+        sampling = (f"{meter.interval_s:g} s sampling" if meter.interval_s
+                    else "one count for the whole episode")
+        print(f"      cpu: measuring {run} ({meter.method}, {meter.device}, "
+              f"{sampling})"
+              + (" - SIMULATED" if meter.simulated else ""))
+        try:
+            yield envelope
+        finally:
+            stop = envelope["stop"] = meter.stop()
+            print(f"      cpu: stopped {stop.get('energy_j')} J in "
+                  f"{stop.get('duration_s')} s"
+                  + (f", {stop.get('samples')} sample(s), peak "
+                     f"{stop.get('peak_power_w')} W" if stop.get("samples") else ""))
+
+
+def cpu_preflight():
+    """`measure_cpu_energy.probe`: is there a package counter this container may read?
+
+    Called before the matrix, because the alternative is discovering it after an
+    episode has already spent its model time: nothing here estimates, so "no
+    counter" means "no batch".
+    """
+    try:
+        info = cpu_meter.probe()
+    except cpu_meter.RefusalError as exc:
+        print("error: the CPU collector cannot measure in this container")
+        for line in str(exc).splitlines():
+            print(f"       {line}")
+        return False
+    print(f"cpu: {info['method']} on {', '.join(info['domains']) or '-'} "
+          f"({info['detail']})")
+    if info["simulated"]:
+        print("cpu: SIMULATED - A_LEMS_CPU_METHOD=fake: these joules are not a "
+              "measurement and must not enter a table")
+    return True
+
+
+def cpu_baseline():
+    """Idle package power once before the matrix, so every run also reports net energy.
+
+    Optional by design, exactly like the GPU's: the machine may be busy, and a
+    missing baseline only costs accuracy - it must never cost the batch its runs.
+    The value lives in the meter afterwards (`measure_cpu_energy.BASELINE_W`), the
+    way the agent keeps its own for the GPU.
+    """
+    seconds = cpu_meter.baseline_seconds()
+    if seconds <= 0:
+        print("baseline: cpu off (A_LEMS_CPU_BASELINE_S=0) - energy stays gross draw")
+        return None
+    try:
+        reply = cpu_meter.baseline(seconds)
+    except cpu_meter.RefusalError as exc:
+        print(f"note: no cpu idle baseline ({exc}); energy stays gross draw")
+        return None
+    if not reply:
+        return None
+    print(f"baseline: cpu {reply.get('baseline_w')} W idle package over "
+          f"{reply.get('seconds'):g} s - every run now also reports net_energy_j")
     return reply
 
 
@@ -376,11 +545,20 @@ def build_args(argv=None):
 # ---------------------------------------------------------------- the batch
 
 
-def _run_episode(args, trial):
-    """One episode, exactly as `runner.run` runs it; returns the exit code."""
+def _run_episode(args, trial, meter=None):
+    """One episode, exactly as `runner.run` runs it; returns the exit code.
+
+    With a CPU meter the episode runs *inside* it, so the sampled window and the
+    subprocess are one thing: ``meter.run`` handles the timeout by killing the
+    workload (and, under perf, its process group) and answers ``-1``. Without a
+    meter the call is byte-identical to the plain batch's.
+    """
+    command = runner.build_command(args, trial)
     try:
-        return subprocess.run(runner.build_command(args, trial),
-                              cwd=runner.PROJECT_CODE,
+        if meter is not None:
+            return meter.run(command, cwd=runner.PROJECT_CODE,
+                             timeout=args.trial_timeout or None)
+        return subprocess.run(command, cwd=runner.PROJECT_CODE,
                               timeout=args.trial_timeout or None).returncode
     except subprocess.TimeoutExpired:
         print(f"      episode exceeded --trial-timeout {args.trial_timeout:.0f}s")
@@ -390,13 +568,65 @@ def _run_episode(args, trial):
         return -1
 
 
-def measure_one(args, trial):
-    """One episode inside its envelope; returns its row of the energy table.
+def energy_fields(collector, stop):
+    """The row columns of one collector's ``stop`` block.
 
-    The verdict is the batch's (exit 0, a readable ``_summary.json``, a stop reason
-    that is not an infrastructure failure), and two energy verdicts are added: a
-    refused ``/start`` fails the run without running it (code 3), and an envelope
-    that never closed cannot produce energy (code -4).
+    The same names in both trees - which is what makes them joinable on ``run`` -
+    with the two device-specific keys filled where they exist: the GPU's
+    ``run_id``/mounted CSV path, the CPU's ``domains``.
+    """
+    fields = {"energy_j": stop.get("energy_j", ""),
+              "net_energy_j": stop.get("net_energy_j", ""),
+              "avg_power_w": stop.get("avg_power_w", ""),
+              "peak_power_w": stop.get("peak_power_w", ""),
+              "duration_s": stop.get("duration_s", ""),
+              "baseline_w": stop.get("baseline_w", ""),
+              "method": stop.get("method", ""),
+              "samples": stop.get("samples", ""),
+              "start_utc": stop.get("start_utc", ""),
+              "stop_utc": stop.get("stop_utc", ""),
+              "gpu_run_id": "", "host_csv": ""}
+    if collector == GPU:
+        fields["gpu_run_id"] = stop.get("run_id", "")
+        fields["host_csv"] = str(stop.get("csv", "")).replace(os.sep, "/")
+    else:
+        fields["domains"] = stop.get("domains", "")
+    return fields
+
+
+def series_source(collector, stop, envelope):
+    """The CSV a row's series is copied from, or ``None`` when there is none.
+
+    The GPU's lives on the host's mount (``telemetry_path``); the CPU's is the
+    file the meter itself wrote in this container, which needs no mount at all.
+    """
+    if collector == GPU:
+        return telemetry_path(stop.get("csv"))
+    path = envelope.get("csv")
+    return path if path and os.path.isfile(path) else None
+
+
+def report(collector, row):
+    """One console line per collector: the number and what measured it."""
+    line = (f"      {collector}: {row['energy_j']} J ({row['method']}), "
+            f"{row['avg_power_w']} W mean")
+    if row.get("net_energy_j") not in ("", None):
+        line += f", {row['net_energy_j']} J above idle"
+    if row.get("samples"):
+        line += f", {row['samples']} sample(s), peak {row['peak_power_w']} W"
+    if collector == CPU and row.get("method") == cpu_meter.FAKE:
+        line += " - SIMULATED"
+    print(line)
+
+
+def measure_one(args, trial, collectors):
+    """One episode inside its envelopes; returns ``{collector: row}``.
+
+    The verdict is computed once - the batch's own - and copied into every tree, so
+    the GPU row and the CPU row of one episode can never disagree about its score,
+    its stop reason or its exit code. Two energy verdicts are added: a collector
+    that refuses to open fails the run without running it (code 3), and a selected
+    envelope that never closed cannot produce energy (code -4).
 
     Every outcome is recorded, failures included: a table that only lists the runs
     that worked cannot be joined with the aggregate, and a hole is information.
@@ -412,17 +642,27 @@ def measure_one(args, trial):
                          f"{run}.log"), args.log_folder),
     }
     started = time.time()
+    opened = {}
     try:
-        with measuring(run) as envelope:
-            code = _run_episode(args, trial)
-    except CollectorError as exc:
+        # One stack, both envelopes, one subprocess: the CPU meter is entered last
+        # and therefore stopped first, so it closes before the GPU's /stop.
+        with contextlib.ExitStack() as stack:
+            if GPU in collectors:
+                opened[GPU] = stack.enter_context(measuring(run))
+            if CPU in collectors:
+                opened[CPU] = stack.enter_context(
+                    measuring_cpu(run, args.log_folder, trial.model))
+            meter = (opened.get(CPU) or {}).get("meter")
+            code = _run_episode(args, trial, meter=meter)
+    except (CollectorError, cpu_meter.RefusalError) as exc:
         print(f"      {exc}")
         print("      the episode was not run: an unmeasured episode is a hole in "
               "the table")
         row["exit_code"] = 3
         row["seconds"] = round(time.time() - started, 1)
-        return gpu_logs.record(args.log_folder, trial.model, run,
-                               {"start": None, "stop": None}, row)
+        return {name: TREES[name].record(args.log_folder, trial.model, run,
+                                         {"start": None, "stop": None}, row)
+                for name in collectors}
     row["seconds"] = round(time.time() - started, 1)
 
     episode = results.load_summary(
@@ -442,54 +682,61 @@ def measure_one(args, trial):
             code = -3
             print(f"      exited 0 but the episode stopped with {stop_reason!r}")
 
-    stop = envelope.get("stop") or {}
-    if stop:
-        row.update(energy_j=stop.get("energy_j", ""),
-                   net_energy_j=stop.get("net_energy_j", ""),
-                   avg_power_w=stop.get("avg_power_w", ""),
-                   duration_s=stop.get("duration_s", ""),
-                   baseline_w=stop.get("baseline_w", ""),
-                   method=stop.get("method", ""),
-                   gpu_run_id=stop.get("run_id", ""),
-                   start_utc=stop.get("start_utc", ""),
-                   stop_utc=stop.get("stop_utc", ""),
-                   host_csv=str(stop.get("csv", "")).replace(os.sep, "/"))
-    elif code == 0:
-        # The artefacts exist, but the run has no energy - which is the one number
-        # this script exists to produce.
+    stops = {name: (opened.get(name) or {}).get("stop") or {} for name in collectors}
+    missing = [name for name in collectors if not stops[name]]
+    if code == 0 and missing:
+        # The artefacts exist, but a selected collector has no energy - which is
+        # the one number this script exists to produce.
         code = -4
-        print("      the envelope never closed with a summary - no energy for "
-              "this run")
+        print(f"      the {' + '.join(missing)} envelope closed without a summary "
+              f"- no energy for this run")
     row["exit_code"] = code
 
-    row = gpu_logs.record(args.log_folder, trial.model, run, envelope, row,
-                          source=telemetry_path(stop.get("csv")))
-    if stop:
-        net = row.get("net_energy_j")
-        print(f"      energy: {row['energy_j']} J ({row['method']}), "
-              f"{row['avg_power_w']} W mean"
-              + (f", {net} J above idle" if net not in ("", None) else "")
-              + (f", {row['samples']} sample(s), peak {row['peak_power_w']} W"
-                 if row.get("samples") else ""))
-    return row
+    rows = {}
+    for name in collectors:
+        energy_row = dict(row)
+        energy_row.update(energy_fields(name, stops[name]))
+        envelope = opened.get(name) or {"start": None, "stop": None}
+        rows[name] = TREES[name].record(
+            args.log_folder, trial.model, run, envelope, energy_row,
+            source=series_source(name, stops[name], envelope))
+        if stops[name]:
+            report(name, rows[name])
+    if CPU in collectors:
+        # The meter's file was the transport, not the evidence: the copy in the
+        # model folder is. Delete it once a record points at the copy.
+        partial = (opened.get(CPU) or {}).get("csv")
+        if partial and rows[CPU].get("series"):
+            try:
+                os.remove(partial)
+            except OSError:
+                pass
+    return rows
 
 
 # ---------------------------------------------------------------- entry point
 
 
 def main(argv=None):
-    """Resolve the matrix, check the agent, then one envelope per episode."""
+    """Resolve the matrix, check the collectors, then one envelope per episode."""
     os.chdir(runner.PROJECT_CODE)   # the cwd of an episode: relative paths agree
     farm_config.load_config()
     raw = build_args(argv)
+    collectors, raw = parse_collectors(raw)
     if any(arg in ("-h", "--help") for arg in raw):
         print("gpu_energy_cons.py: the flags below are the batch's - every episode "
-              "runs inside a GPU collector envelope")
-        print("  collector: GPU_TELEMETRY_URL, A_LEMS_TOKEN, A_LEMS_GPU, "
-              "GPU_TELEMETRY_DIR, A_LEMS_BASELINE_S")
-        print("  logs: A_LEMS_GPU_LOGS (root of the energy tree, default "
-              "<log-folder>/gpu_energy_logs)")
-        print("  extra exit code: 3 = the collector cannot measure; no episode is "
+              "runs inside the selected energy envelope(s)")
+        print("  collectors: --cpu-only (package) | --cpu (GPU + package) | "
+              "no flag (GPU)")
+        if GPU in collectors:
+            print("  gpu: GPU_TELEMETRY_URL, A_LEMS_TOKEN, A_LEMS_GPU, "
+                  "GPU_TELEMETRY_DIR, A_LEMS_BASELINE_S")
+        if CPU in collectors:
+            print("  cpu: A_LEMS_CPU_METHOD, A_LEMS_CPU_DOMAINS, A_LEMS_CPU_SOCKET, "
+                  "A_LEMS_CPU_SAMPLE_MS, A_LEMS_CPU_BASELINE_S")
+        print("  logs: A_LEMS_GPU_LOGS, A_LEMS_CPU_LOGS (roots of the two trees, "
+              "default <log-folder>/<collector>_energy_logs)")
+        print("  extra exit code: 3 = a collector cannot measure; no episode is "
               "run then")
         print("  full contract: module docstring of gpu_energy_cons.py")
         print("")
@@ -528,26 +775,44 @@ def main(argv=None):
 
     args.log_folder = os.path.abspath(args.log_folder)
     os.makedirs(args.log_folder, exist_ok=True)
-    # The energy tree, and what an earlier invocation already measured: `--resume`
-    # trusts the tree's own records, not `_summary.json`, because a plain batch run
+    # The energy trees, and what an earlier invocation already measured: `--resume`
+    # trusts the trees' own records, not `_summary.json`, because a plain batch run
     # can own an episode's artefacts and no energy at all.
-    logs = gpu_logs.root(args.log_folder)
-    os.makedirs(logs, exist_ok=True)
-    previous = gpu_logs.measured(args.log_folder)
+    trees = {}
+    for name in collectors:
+        folder = TREES[name].root(args.log_folder)
+        os.makedirs(folder, exist_ok=True)
+        trees[name] = (folder, TREES[name].measured(args.log_folder))
 
-    baseline_note = f"{BASELINE_S:.0f}s" if BASELINE_S > 0 else "off"
-    print(f"collector: {HOST} | GPU {GPU} | idle baseline {baseline_note}")
-    print(f"gpu logs:  {logs}")
+    print(f"collectors: {' + '.join(collectors)}")
+    if GPU in collectors:
+        baseline_note = f"{BASELINE_S:.0f}s" if BASELINE_S > 0 else "off"
+        print(f"gpu:        {HOST} | GPU {GPU_INDEX} | idle baseline "
+              f"{baseline_note}")
+        print(f"gpu logs:   {trees[GPU][0]}")
+    if CPU in collectors:
+        seconds = cpu_meter.baseline_seconds()
+        method = os.environ.get(cpu_meter.ENV_METHOD) or "auto"
+        print(f"cpu:        {cpu_meter.ENV_METHOD}={method} | idle baseline "
+              f"{f'{seconds:.0f}s' if seconds > 0 else 'off'}")
+        print(f"cpu logs:   {trees[CPU][0]}")
     print("")
 
     code = runner.preflight(args, trials)
     if code:
         return code
-    if not collector_preflight():
+    if GPU in collectors and not collector_preflight():
         return 3
-    baseline = measure_baseline()
-    if baseline:
-        gpu_logs.write_baseline(args.log_folder, baseline)
+    if CPU in collectors and not cpu_preflight():
+        return 3
+    if GPU in collectors:
+        baseline = measure_baseline()
+        if baseline:
+            gpu_logs.write_baseline(args.log_folder, baseline)
+    if CPU in collectors:
+        reply = cpu_baseline()
+        if reply:
+            cpu_logs.write_baseline(args.log_folder, reply)
 
     summary = instructions.matrix_summary(trials)
     print("")
@@ -577,32 +842,46 @@ def main(argv=None):
             attempted += 1
             considered.append(trial)
             run = trial.artefact_stem()
-            if args.resume and run in previous:
-                skipped += 1
-                print(f"[{number}/{total}] skip (measured): {trial.label}")
-                continue
+            if args.resume:
+                measured = [name for name in collectors if run in trees[name][1]]
+                if len(measured) == len(collectors):
+                    skipped += 1
+                    print(f"[{number}/{total}] skip (measured): {trial.label}")
+                    continue
+                if measured:
+                    # --resume cannot add a collector to a finished episode: the
+                    # episode has to be played again, so this is a new measurement
+                    # of the same cell - and the rows it replaces are this run's.
+                    wanted = [name for name in collectors if name not in measured]
+                    print(f"      note: {run} has {'+'.join(measured)} energy but "
+                          f"no {'+'.join(wanted)} - a re-run measures "
+                          f"{'both' if len(collectors) > 1 else 'it'} again and "
+                          f"replaces this run's rows")
             print(f"[{number}/{total}] {trial.label}")
             print(f"      task: {trial.prompt}")
             print(f"      run: {run}")
-            row = measure_one(args, trial)
-            new_rows.append(row)
+            rows = measure_one(args, trial, collectors)
+            new_rows.append(rows)
             # The tables are rewritten from the run records after every episode, so
             # an interrupted batch still matches what is on disk.
-            gpu_logs.write_tables(args.log_folder)
+            for name in collectors:
+                TREES[name].write_tables(args.log_folder)
 
-            if row["exit_code"] == 0:
-                print(f"      ok in {row['seconds']}s (stop reason: "
-                      f"{row['stop_reason']})")
+            row = rows.get(collectors[0]) or {}
+            if row.get("exit_code") == 0:
+                print(f"      ok in {row.get('seconds')}s (stop reason: "
+                      f"{row.get('stop_reason')})")
             else:
                 failures.append(trial)
-                print(f"      FAILED (code {row['exit_code']}) after "
-                      f"{row['seconds']}s")
-                if row["exit_code"] == 3:
-                    # The agent is gone: every further episode would be a hole in
-                    # the table, and its model time would be spent unmeasured.
+                print(f"      FAILED (code {row.get('exit_code')}) after "
+                      f"{row.get('seconds')}s")
+                if row.get("exit_code") == 3:
+                    # A collector is gone: every further episode would be a hole in
+                    # a table, and its model time would be spent unmeasured.
                     unreachable = True
-                    print("the collector cannot measure - stopping the batch; "
-                          "restart the host agent and re-run with --resume")
+                    print("a collector cannot measure - stopping the batch; fix it "
+                          "(host agent, RAPL mount or perf capability) and re-run "
+                          "with --resume")
                     break
                 if args.fail_fast:
                     print("--fail-fast: stopping the batch")
@@ -610,24 +889,27 @@ def main(argv=None):
             print("")
     except KeyboardInterrupt:
         print("")
-        print("interrupted - the running episode was killed and its envelope "
+        print("interrupted - the running episode was killed and its envelopes "
               "closed")
-        gpu_logs.write_tables(args.log_folder)
-        gpu_logs.write_samples(args.log_folder)
+        for name in collectors:
+            TREES[name].write_tables(args.log_folder)
+            TREES[name].write_samples(args.log_folder)
         return 130
 
-    paths = gpu_logs.write_tables(args.log_folder)
-    sample_path, sample_rows, unreadable = gpu_logs.write_samples(args.log_folder)
     print(f"{len(new_rows) - len(failures)}/{len(new_rows)} episode(s) measured in "
           f"{time.time() - started:.1f}s"
           + (f" ({skipped} skipped by --resume)" if skipped else ""))
-    print(f"table:    {paths['episodes']}")
-    print(f"cells:    {paths['cells']}")
-    print(f"samples:  {sample_path} ({sample_rows} row(s)"
-          + (f", {unreadable} unreadable line(s)" if unreadable else "") + ")")
-    tree = gpu_logs.describe(args.log_folder)
-    print(f"tree:     {tree['root']} - {tree['episodes']} run(s), "
-          f"{tree['series']} series, {tree['baselines']} baseline(s)")
+    for name in collectors:
+        paths = TREES[name].write_tables(args.log_folder)
+        sample_path, sample_rows, unreadable = TREES[name].write_samples(
+            args.log_folder)
+        tree = TREES[name].describe(args.log_folder)
+        print(f"{name} table:   {paths['episodes']}")
+        print(f"{name} cells:   {paths['cells']}")
+        print(f"{name} samples: {sample_path} ({sample_rows} row(s)"
+              + (f", {unreadable} unreadable line(s)" if unreadable else "") + ")")
+        print(f"{name} tree:    {tree['root']} - {tree['episodes']} run(s), "
+              f"{tree['series']} series, {tree['baselines']} baseline(s)")
     if considered:
         # The batch's own aggregate of the attempted episodes - the same tables
         # `run_instruction_catalogue.py` writes, so the folder is complete.
@@ -638,8 +920,11 @@ def main(argv=None):
     if failures:
         print(f"{len(failures)} episode(s) failed: "
               f"{'; '.join(trial.label for trial in failures)}")
-    print("rebuild the energy tables at any time: python -m "
-          f"instruction_catalogue.gpu_logs \"{args.log_folder}\"")
+    print("rebuild the energy tables at any time:")
+    for name in collectors:
+        flag = " --cpu" if name == CPU else ""
+        print(f"  python -m instruction_catalogue.gpu_logs{flag} "
+              f"\"{args.log_folder}\"")
     return 3 if unreachable else 1 if failures else 0
 
 

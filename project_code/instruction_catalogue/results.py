@@ -103,6 +103,16 @@ ROW_FIELDS = ("model", "backend", "task", "level", "prompt_index", "repeat",
 FAILED_STOP_REASONS = ("llm_error", "check_api_fail")
 
 
+def is_failed(summary):
+    """True when a recorded episode stopped for one of `FAILED_STOP_REASONS`.
+
+    This is the one test `--resume` and `--retry-failed` must agree on: a summary
+    file exists for a timed-out episode too - that is the point of writing it - so
+    "the file is there" says nothing about the episode having played.
+    """
+    return bool(summary) and summary.get("stop_reason") in FAILED_STOP_REASONS
+
+
 def _summary_label(path, log_folder):
     """The artefact name as recorded: relative to the batch folder when nested.
 

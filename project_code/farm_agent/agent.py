@@ -4,18 +4,162 @@ import json
 import logging
 import time
 
-from ollama import Client
+import httpx
+from ollama import Client, ResponseError
 from ollama._types import ChatResponse
 from openai import BadRequestError, OpenAI
 
 from . import runtime
-from .config import ollama_url, openai_api_key, openai_base_url, openai_enable_thinking
+from .config import (ollama_keep_alive, ollama_num_ctx, ollama_think, ollama_url,
+                     openai_api_key, openai_base_url, openai_enable_thinking)
 from .episode import resolve_task
 from .prompt import build_system_message, tool_arguments
 from .rendering import state_to_text
 from .tools import available_tools
 
 logger = logging.getLogger(__name__)
+
+#: Transport failures are retried before a turn - and with it the episode - is
+#: given up. Ollama unloads an idle model after five minutes, and loading a 17 GB
+#: 27B takes longer than one turn may take, so the reload lands inside
+#: `--llm-timeout` and the whole episode dies as `llm_error` on its first turn.
+LLM_RETRIES = 2
+#: Seconds before the first retry, doubled per retry (5 s, then 10 s). The wait is
+#: cheap next to the episode a failed turn throws away.
+LLM_RETRY_BACKOFF = 5.0
+
+#: History cap of both loops: the system prompt, the task and this many recent
+#: messages. A step appends one assistant turn plus one tool result, and every tool
+#: result repeats the state block, so a 60-step run outgrows the context window of
+#: the server mid-episode - the prompts of the 27B sweep reached 16-25k tokens and
+#: then died on a read timeout (`llm_error`) rather than on a clean 400.
+MAX_HISTORY_MESSAGES = 42
+
+
+def trim_history(messages):
+    """Drop the oldest turns, never splitting a `tool_calls` turn from its results.
+
+    vLLM rejects a `tool` message that answers no preceding `tool_calls`, so a
+    window that starts in the middle of a step loses those orphan results with it.
+    Ollama accepts orphans, but both loops keep the same window so that an episode
+    of one backend stays comparable with the other. The world is not lost with
+    them: every tool result carries `current_state`.
+    """
+    if len(messages) <= MAX_HISTORY_MESSAGES:
+        return messages
+    tail = messages[-(MAX_HISTORY_MESSAGES - 2):]
+    while tail and tail[0].get("role") == "tool":
+        tail = tail[1:]
+    return messages[:2] + tail
+
+
+def llm_transient_error(error):
+    """True when resending the same request can plausibly succeed.
+
+    Everything `httpx` raises on the way to the server is transient - timeouts
+    above all, but also a reset connection or a proxy error - and so is the
+    builtin `ConnectionError` that `ollama.Client` re-raises a refused connection
+    as. A `ResponseError` only is when the server itself says "not now" (429,
+    5xx); a 400/404 is answered the same way forever.
+    """
+    if isinstance(error, (httpx.TransportError, ConnectionError)):
+        return True
+    status = getattr(error, "status_code", None)
+    return isinstance(status, int) and status in (429, 500, 502, 503, 504)
+
+
+def ollama_request_extras():
+    """The optional `/api/chat` fields of the `ollama:` block of config.yaml.
+
+    Three fields the harness never sent, each optional (`None` = send nothing):
+
+    * `keep_alive` - Ollama's default unloads the weights after five idle minutes,
+      and the reload is charged to the *next* turn's `--llm-timeout`;
+    * `think` - `false` keeps a reasoning model from spending the turn (and the
+      timeout) on hidden tokens;
+    * `num_ctx` - pins the KV cache instead of leaving the size to the server.
+    """
+    extras = {}
+    keep_alive = ollama_keep_alive()
+    if keep_alive is not None:
+        extras["keep_alive"] = keep_alive
+    think = ollama_think()
+    if think is not None:
+        extras["think"] = bool(think)
+    num_ctx = ollama_num_ctx()
+    if num_ctx:
+        extras["options"] = {"num_ctx": int(num_ctx)}
+    return extras
+
+
+def _ollama_chat(client, model, messages, schemas, step, extras):
+    """`client.chat` with `LLM_RETRIES` retries and exponential backoff.
+
+    `llm_calls` is incremented *before* the request on purpose: a turn that times
+    out is one LLM request, and a first-turn timeout used to write
+    `no_of_llm_calls: 0`. For the same reason the wait of a failed attempt is
+    recorded in `llm_time_taken` - a 60 s timeout is a latency fact, not a missing
+    value - while the backoff sleep is not: that is the harness waiting, not the
+    model.
+    """
+    delay = LLM_RETRY_BACKOFF
+    attempt = 0
+    while True:
+        attempt += 1
+        runtime.llm_calls += 1
+        started = time.time()
+        try:
+            response = client.chat(model=model, messages=messages, tools=schemas,
+                                   **extras)
+        except Exception as exc:
+            runtime.llm_time_taken.append(time.time() - started)
+            if attempt > LLM_RETRIES or not llm_transient_error(exc):
+                raise
+            logger.warning(f"step {step}: LLM request {attempt} failed "
+                           f"({type(exc).__name__}: {exc}) - retrying in {delay:.0f}s")
+            print(f"llm request {attempt} failed ({exc}) - retrying in {delay:.0f}s")
+            time.sleep(delay)
+            delay *= 2
+            continue
+        runtime.llm_time_taken.append(time.time() - started)
+        return response
+
+
+def chat_completion_ollama(client, model, messages, schemas, step):
+    """One completion, with the `ollama:` extras and a fallback for older servers.
+
+    `keep_alive`, `think` and `options.num_ctx` are optional fields of `/api/chat`,
+    so a server that predates one of them answers 400 - and that is not a failed
+    step: the same prompt is resent without it, the graceful degradation
+    `chat_completion` below already gives the vLLM/NIM path for
+    `chat_template_kwargs`.
+    """
+    extras = ollama_request_extras()
+    # Most specific request first, then one field less at a time, then none:
+    # `think` is the field an old server is likeliest to reject, `keep_alive` the
+    # one it must have known longest, so the order only decides how much is
+    # dropped per attempt. Without an `ollama:` block there is exactly one attempt.
+    variants = []
+    for candidate in (extras,
+                      {key: value for key, value in extras.items() if key != "think"},
+                      {key: value for key, value in extras.items() if key != "options"},
+                      {}):
+        if candidate not in variants:
+            variants.append(candidate)
+
+    last_error = None
+    for index, variant in enumerate(variants):
+        try:
+            return _ollama_chat(client, model, messages, schemas, step, variant)
+        except ResponseError as exc:
+            if exc.status_code != 400:
+                raise
+            last_error = exc
+            if index + 1 < len(variants):
+                dropped = sorted(set(variant) - set(variants[index + 1]))
+                logger.info(f"step {step}: Ollama answered 400 ({exc}) - retrying "
+                            f"without {', '.join(dropped) or 'every extra'}")
+    raise last_error
 
 
 def run_agent(args, schemas):
@@ -45,16 +189,15 @@ def run_agent(args, schemas):
             # observation the model reads after this step's action.
             runtime.STEPS_USED = i
             # Client-side clock around the completion: `total_duration` below is what
-            # the server measured (prefill + decode), this one also carries queueing
-            # and the network - it is what `llm_time_taken` reports.
-            turn_started = time.time()
-            response: ChatResponse = client.chat(model=args.model, messages=messages, tools=schemas)
-            runtime.llm_time_taken.append(time.time() - turn_started)
-            # One completion per turn - what `no_of_llm_calls` reports in the summary. It
-            # used to be `len(time_taken)`, i.e. the tool calls that *succeeded*, which
-            # made a 60-turn episode look like a run of 56 model calls.
-            runtime.llm_calls += 1
-
+            # the server measured (prefill + decode), the one `llm_time_taken` records
+            # also carries queueing and the network - and, since `chat_completion_ollama`
+            # retries, it is the time of the request that answered (a failed attempt is
+            # recorded with its own entry, the backoff sleep is not).
+            # The window is capped like the vLLM loop's: a 60-step history of state
+            # blocks outgrows the context Ollama serves and the turn dies on a timeout.
+            messages = trim_history(messages)
+            response: ChatResponse = chat_completion_ollama(client, args.model, messages,
+                                                            schemas, i)
         
             print(f"input_tokens: {response['prompt_eval_count']}")
             print("Prompt evaluation time:", response["prompt_eval_duration"] / 1e9, "seconds")
@@ -201,28 +344,6 @@ def run_agent(args, schemas):
         logger.error(f"model server: {ollama_url()}")
 
 
-#: History cap of the vLLM loop: the system prompt, the task and this many recent
-#: messages. A step appends one assistant turn plus one tool result and every tool
-#: result repeats the state block, so a 60-step run outgrows the context window of
-#: the server mid-episode - and then every following step answers 400.
-MAX_HISTORY_MESSAGES = 42
-
-
-def trim_history(messages):
-    """Drop the oldest turns, never splitting a `tool_calls` turn from its results.
-
-    vLLM rejects a `tool` message that answers no preceding `tool_calls`, so a
-    window that starts in the middle of a step loses those orphan results with it.
-    The world is not lost with them: every tool result carries `current_state`.
-    """
-    if len(messages) <= MAX_HISTORY_MESSAGES:
-        return messages
-    tail = messages[-(MAX_HISTORY_MESSAGES - 2):]
-    while tail and tail[0].get("role") == "tool":
-        tail = tail[1:]
-    return messages[:2] + tail
-
-
 def tool_call_id(tool_call, step, index):
     """The `id` the follow-up `tool` message has to quote (synthesised if absent)."""
     return getattr(tool_call, "id", None) or f"call_{step}_{index}"
@@ -327,10 +448,16 @@ def run_agent_openai(args, schemas):
             runtime.STEPS_USED = i
             st_time = time.time()
             messages = trim_history(messages)
-            response = chat_completion(client, args.model, messages, schemas, i, thinking)
+            # Counted before the request, like the Ollama loop: a step that dies on a
+            # 429/timeout is still an LLM request, and the summary must not report 0.
+            # The clock is closed in `finally` for the same reason: a failed request
+            # has a latency too, and `len(llm_time_taken) == no_of_llm_calls` holds.
             runtime.llm_calls += 1
-            step_time = time.time() - st_time
-            runtime.llm_time_taken.append(step_time)
+            try:
+                response = chat_completion(client, args.model, messages, schemas, i, thinking)
+            finally:
+                runtime.llm_time_taken.append(time.time() - st_time)
+            step_time = runtime.llm_time_taken[-1]
             message = response.choices[0].message
 
             usage = getattr(response, "usage", None)

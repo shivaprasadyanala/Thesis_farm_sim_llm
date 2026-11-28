@@ -84,6 +84,39 @@ def openai_enable_thinking(backend="vllm"):
     return openai_config(backend).get("enable_thinking")
 
 
+def ollama_config():
+    """`ollama:` block of config.yaml ({} when the key is missing)."""
+    return runtime.config_data.get("ollama") or {}
+
+
+def ollama_keep_alive():
+    """`ollama.keep_alive` - sent on every `/api/chat` request.
+
+    `None` (the key is absent) sends nothing and leaves Ollama's own default (five
+    idle minutes) in charge, which unloads the weights between two turns of a slow
+    episode and charges the reload to the next `--llm-timeout`. `-1` keeps them
+    loaded forever, `"24h"` for a day.
+    """
+    return ollama_config().get("keep_alive")
+
+
+def ollama_think():
+    """`ollama.think` - `false` skips the reasoning trace, `None` sends nothing.
+
+    Same switch as `vllm.enable_thinking`, only as a plain field of `/api/chat`
+    rather than a chat-template kwarg.
+    """
+    return ollama_config().get("think")
+
+
+def ollama_num_ctx():
+    """`ollama.num_ctx` - KV-cache size, put into the request's `options`.
+
+    `None`/`0` sends no options and lets the server pick its own default.
+    """
+    return ollama_config().get("num_ctx")
+
+
 def llm_endpoint(args):
     """Where the run sends its prompts: NVIDIA NIM, the vLLM proxy or Ollama."""
     if args.backend != "ollama":
@@ -121,11 +154,12 @@ def parse_args(argv=None):
     # four steps short. `normal` finishes in 30-45, so the extra headroom is only
     # spent on the preset that needs it.
     parser.add_argument("--max-steps", type=int, default=60, help="maximum number of LLM steps")
-    parser.add_argument("--llm-timeout", type=float, default=60.0,
-                        help="seconds to wait for one LLM reply (default 60). Raise it when the "
-                             "Ollama host has fallen back to CPU: a 26B model then needs longer "
-                             "than a minute just to evaluate the prompt, and the run dies as "
-                             "`llm_error` with `size_vram: 0` in /api/ps")
+    parser.add_argument("--llm-timeout", type=float, default=300.0,
+                        help="seconds to wait for one LLM reply (default 300). A turn of a "
+                             "27B model over a crowded proxy - or the first turn after Ollama "
+                             "evicted it - takes longer than the old 60 s, and a turn that "
+                             "times out ends the episode as `llm_error`. `ollama.keep_alive` "
+                             "in config.yaml keeps the weights loaded between turns")
     parser.add_argument("--log-folder", type=str,
                         default="../experiments/test_logs_baseline_farm_sim",
                         help="folder for the .log/.png/.json artefacts")
@@ -164,6 +198,10 @@ def parse_args(argv=None):
 
     if args.max_advance_ticks < 0:
         parser.error("--max-advance-ticks must be >= 0 (0 turns the cap off)")
+    if args.llm_timeout <= 0:
+        # `0` would be an instant timeout: every turn would read as `timed out`,
+        # which looks exactly like a dead server. There is no "off" for this one.
+        parser.error("--llm-timeout must be > 0 (seconds to wait for one LLM reply)")
     return args
 
 

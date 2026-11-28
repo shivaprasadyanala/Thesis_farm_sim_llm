@@ -23,6 +23,16 @@ Module map::
                    subprocess per trial, --resume/--limit/--smoke/--fail-fast
     results        the per-episode _summary.json files, aggregated into
                    results[model][task][level] plus a long-format CSV
+    plots          the per-model figures (completion, the latency clocks, the
+                   trade-off) and the energy figures of a measured batch
+    gpu_logs       the GPU energy tree of a measured batch (`../gpu_energy_cons.py`)
+    cpu_logs       the CPU package tree of the same batch (``--cpu``/``--cpu-only``)
+
+The energy of a batch is measured by ``../gpu_energy_cons.py`` and written into two
+sibling trees next to the score tables - ``gpu_energy_logs/`` from the host's NVML
+agent and ``cpu_energy_logs/`` from the package counter of the machine the episode
+runs on (``../measure_cpu_energy.py``). The two share every row field, so the same
+episode can be joined across them on ``run``.
 
 Documented invocation (run from ``project_code``)::
 
@@ -37,7 +47,10 @@ Documented invocation (run from ``project_code``)::
 
 __all__ = [
     "cli",
+    "cpu_logs",
+    "gpu_logs",
     "instructions",
+    "plots",
     "results",
     "runner",
 ]

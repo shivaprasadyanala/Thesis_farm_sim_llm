@@ -83,7 +83,7 @@ a conda env in `my_env/`):
 | `--seed` | `1` | RNG seed of the episode (weather, market, plot draw); `(seed, actions)` fully determines a run |
 | `--task` | the objective text | rewrites the instruction wording; the objective stays what is scored |
 | `--max-steps` | `60` | LLM steps; the remaining budget is printed in every observation |
-| `--llm-timeout` | `60` | seconds per LLM reply (raise it for a 27B model on CPU, for `--vllm` or for hosted NIM) |
+| `--llm-timeout` | `300` | seconds per LLM reply; 60 s was too short for a 27B turn over a crowded proxy (a turn that times out ends the episode as `llm_error`). A transport failure is retried twice (5 s, 10 s) before the turn is given up, and `ollama.keep_alive` keeps the weights loaded between turns |
 | `--max-advance-ticks` | `120` | cap on one `advance` (120 ticks = 1 game day, `0` = off); also capped at the objective deadline |
 | `--log-folder` | `../experiments/test_logs_baseline_farm_sim` | where the artefacts go |
 | `--tag` | empty | suffix for the artefact names (see [Outputs](#outputs)) |
@@ -123,7 +123,7 @@ python -m farm_agent --check-api
 
 ## `config.yaml`
 
-Only three blocks are read by this harness (everything else in the file belongs to
+Only four blocks are read by this harness (everything else in the file belongs to
 the older scripts); `vllm:` and `nvidia:` have the same shape, because both are
 OpenAI-compatible servers:
 
@@ -131,16 +131,24 @@ OpenAI-compatible servers:
 | --- | --- |
 | `server_urls.farm_sim_url` | default base URL of the simulation (`http://127.0.0.1:3111`) |
 | `server_urls.ollama_url` | Ollama host for the default loop (`http://hal9000.skim.th-owl.de:11430`) |
+| `ollama.keep_alive` | `/api/chat` field: how long the weights stay loaded (`"24h"`, `-1` = forever). Without it Ollama unloads after five idle minutes and the reload is charged to the next turn's `--llm-timeout` |
+| `ollama.think` | `false` asks the template to skip the reasoning trace (the `/api/chat` twin of `vllm.enable_thinking`); `null` sends nothing |
+| `ollama.num_ctx` | KV-cache size for `/api/chat`; `null` leaves the server default |
 | `vllm.base_url` / `nvidia.base_url` | OpenAI-compatible endpoint used by `--vllm` / `--nvidia` |
 | `vllm.api_key` / `nvidia.api_key` | bearer key for those endpoints (any placeholder is fine if the proxy needs none) |
 | `vllm.model` / `nvidia.model` | model id used when that flag is passed without `--model` |
 | `vllm.enable_thinking` / `nvidia.enable_thinking` | `false` asks the template to skip the reasoning trace; `null` sends no chat-template kwargs at all |
 
+A key of the `ollama:` block that is absent (or `null`) is simply not sent, so a
+server that predates one of those fields keeps working: a 400 on the request is
+answered by resending it without the extra field, the same graceful fallback the
+`--vllm` path gives `chat_template_kwargs`.
+
 `model.name` is **not** read here - the CLI takes `--model` (or `vllm.model` /
 `nvidia.model`), so editing that key changes nothing for this harness.
 
 Precedence everywhere: command line > `config.yaml` > built-in default
-(`http://127.0.0.1:3111` for the game, `:60` s for the LLM timeout, `easy` for
+(`http://127.0.0.1:3111` for the game, `300` s for the LLM timeout, `easy` for
 the preset, `1` for the seed).
 
 ## How a run works
@@ -371,7 +379,7 @@ prints a small but non-zero `points_gained`: it plants, harvests and sells.
 | --- | --- |
 | `cannot reach the farm-sim server at http://127.0.0.1:3111` (exit 1) | the server is on 3100 (a bare `npm start`); run `PORT=3111 npm start` or pass `--url` |
 | `--check-api` exits 1 | read the failing step it prints; usually no seed to plant (money) or water still missing |
-| `stop_reason: llm_error` | the model did not answer within `--llm-timeout` (default 60 s) - raise it, or check `ollama list` / the vLLM proxy / NIM (the hosted endpoint can take minutes per turn) |
+| `stop_reason: llm_error` | the model did not answer within `--llm-timeout` (default 300 s, after two retries on a timeout / dropped connection) - raise it, or check `ollama list` / the vLLM proxy / NIM (the hosted endpoint can take minutes per turn). If it is the *first* turn of a model that was idle, Ollama was reloading the weights: set `ollama.keep_alive` in `config.yaml` |
 | vLLM answers 400 about `tool_calls` | the server was started without `--enable-auto-tool-choice --tool-call-parser ...` |
 | NIM answers 404/400 for the model | `nvidia.model` is not an id `GET /v1/models` lists for that key, or its model card does not list tool calling; the id in `config.yaml` is only a default and `--model` overrides it |
 | `objective mismatch: the episode scores X, this run expects Y` (exit 3) | `--no-reset` adopted a leftover episode, or `--objective` names a goal the preset does not default to - drop `--no-reset` or pass a matching `--objective` |

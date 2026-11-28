@@ -169,6 +169,33 @@ def build_command(args, trial):
     return command
 
 
+def archive_failed_artefacts(trial, log_folder, group_models, stop_reason):
+    """Move the artefacts of a failed episode aside before it is run again.
+
+    A retried episode rewrites its `.log` (``filemode='w'``) and its
+    ``_summary.json``, so without this the evidence of *why* it failed - the
+    timeout, the tokens it burned, the tool sequence before it died - would be the
+    first thing a retry destroys. Everything named after the episode's stem moves
+    into ``_failed_<stop_reason>/``, a sub-folder neither ``--resume`` (it looks up
+    the episode's own stem) nor ``results.collect`` (it reads ``trial.summary_path``)
+    ever reads. Returns the folder it moved them to, or ``None`` if there was
+    nothing to move.
+    """
+    folder = trial.folder(log_folder, group_models)
+    if not os.path.isdir(folder):
+        return None
+    stem = trial.artefact_stem()
+    names = [name for name in os.listdir(folder)
+             if name.startswith(stem) and os.path.isfile(os.path.join(folder, name))]
+    if not names:
+        return None
+    target = os.path.join(folder, f"_failed_{stop_reason or 'failed'}")
+    os.makedirs(target, exist_ok=True)
+    for name in names:
+        os.replace(os.path.join(folder, name), os.path.join(target, name))
+    return target
+
+
 def run(args, trials):
     """Pre-flight, one subprocess per episode, then the aggregate.
 
@@ -207,15 +234,32 @@ def run(args, trials):
             print(f"--limit {args.limit} reached; {total - number + 1} episode(s) "
                   f"not attempted")
             break
-        if args.resume and os.path.isfile(
-                trial.summary_path(args.log_folder, args.group_models)):
-            considered.append(trial)
-            attempted += 1
-            print(f"[{number}/{total}] skip (recorded): {trial.label}")
-            continue
+        summary_path = trial.summary_path(args.log_folder, args.group_models)
+        recorded = None
+        retry_note = ""
+        if args.resume and os.path.isfile(summary_path):
+            recorded = results.load_summary(summary_path)
+            # A summary that exists is not an episode that played: a timed-out run
+            # writes one too, with `stop_reason: llm_error`. `--retry-failed`
+            # re-runs exactly those (and an unreadable file, which would otherwise
+            # stay a hole in the matrix forever) - everything else is a skip.
+            if args.retry_failed and (recorded is None
+                                      or results.is_failed(recorded)):
+                stored = (recorded or {}).get("stop_reason") or "unreadable"
+                archived = archive_failed_artefacts(
+                    trial, args.log_folder, args.group_models, stored)
+                retry_note = f"retry ({stored}), "
+                if archived:
+                    print(f"[{number}/{total}] previous attempt archived: {archived}")
+            else:
+                considered.append(trial)
+                attempted += 1
+                stops = (recorded or {}).get("stop_reason") or "unreadable"
+                print(f"[{number}/{total}] skip (recorded: {stops}): {trial.label}")
+                continue
         considered.append(trial)
         attempted += 1
-        print(f"[{number}/{total}] {trial.label}")
+        print(f"[{number}/{total}] {retry_note}{trial.label}")
         print(f"      task: {trial.prompt}")
         episode_started = time.time()
         try:
